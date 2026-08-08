@@ -29,10 +29,10 @@ from scripts.bilibili_roundtrip import (  # noqa: E402
     DEFAULT_DOWNLOAD_FORMAT,
     biliup_base,
     build_upload_command,
-    decode_downloaded,
     download_with_ytdlp,
     export_biliup_cookies_to_netscape,
     ffprobe_video as platform_ffprobe_video,
+    parse_decoder_output,
     parse_upload_identity,
     recover_bvid_by_title,
     resolve_executable,
@@ -168,17 +168,38 @@ def make_title(prefix: str, case: ScanCase, scan_stamp: str, index: int) -> str:
     )[:80]
 
 
-def ensure_decode_matches(
-    stats: dict[str, Any], expected_sha256: str, *, label: str
-) -> None:
-    if not stats.get("file_fully_recovered") or not stats.get("sha256_match"):
-        raise RuntimeError(f"{label} decoder did not report a verified recovery")
-    for key in ("original_sha256", "recovered_sha256"):
-        if stats.get(key) != expected_sha256:
-            raise RuntimeError(
-                f"{label} {key} differs from input: "
-                f"{stats.get(key)} != {expected_sha256}"
-            )
+def decode_video(
+    video: Path,
+    run_dir: Path,
+    expected_sha256: str,
+) -> tuple[bool, dict[str, Any], str]:
+    recovered = run_dir / "recovered"
+    shutil.rmtree(recovered, ignore_errors=True)
+    recovered.mkdir(parents=True, exist_ok=True)
+    completed = run_logged(
+        [sys.executable, "video2file.py", str(video), str(recovered)],
+        run_dir / "decode.log",
+    )
+    stats = parse_decoder_output(completed.output)
+    stats["returncode"] = completed.returncode
+
+    errors: list[str] = []
+    if completed.returncode != 0:
+        errors.append(f"decoder exited {completed.returncode}")
+    if not stats.get("file_fully_recovered"):
+        errors.append("decoder did not report full recovery")
+    if not stats.get("sha256_match"):
+        errors.append("decoder SHA256 mismatch")
+    if stats.get("original_sha256") != expected_sha256:
+        errors.append("metadata SHA256 differs from scan input")
+    if stats.get("recovered_sha256") != expected_sha256:
+        errors.append("recovered SHA256 differs from scan input")
+    if errors:
+        tail = error_tail(completed.output)
+        if tail:
+            errors.append(tail)
+        return False, stats, " | ".join(errors)
+    return True, stats, ""
 
 
 def write_case_result(case_dir: Path, result: PlatformScanResult) -> None:
@@ -403,13 +424,16 @@ def run_case(
 
     print("[2/5] local decode verification")
     try:
-        local_stats = decode_downloaded(source_video, case_dir / "local")
-        ensure_decode_matches(local_stats, expected_sha256, label="local")
-        result.local_ok = True
+        local_ok, local_stats, local_error = decode_video(
+            source_video, case_dir / "local", expected_sha256
+        )
+        result.local_ok = local_ok
         result.local_total_frames = local_stats.get("total_frames")
         result.local_qr_decoded = local_stats.get("qr_decoded")
         result.local_qr_failed = local_stats.get("qr_failed")
         result.local_crc_failed = local_stats.get("crc_failed")
+        if not local_ok:
+            raise RuntimeError(local_error)
     except Exception as exc:
         result.local_error = f"{type(exc).__name__}: {exc}"
         write_case_result(case_dir, result)
@@ -521,8 +545,9 @@ def run_case(
 
     print("[5/5] decode Bilibili rendition")
     try:
-        stats = decode_downloaded(platform_video, platform_dir)
-        ensure_decode_matches(stats, expected_sha256, label="platform")
+        platform_ok, stats, decode_error = decode_video(
+            platform_video, platform_dir, expected_sha256
+        )
         result.platform_total_frames = stats.get("total_frames")
         result.platform_qr_decoded = stats.get("qr_decoded")
         result.platform_qr_failed = stats.get("qr_failed")
@@ -538,7 +563,9 @@ def run_case(
         result.platform_original_sha256 = stats.get("original_sha256") or ""
         result.platform_recovered_sha256 = stats.get("recovered_sha256") or ""
         result.platform_sha256_match = bool(stats.get("sha256_match"))
-        result.platform_ok = True
+        result.platform_ok = platform_ok
+        if not platform_ok:
+            raise RuntimeError(decode_error)
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         result.platform_error = (
