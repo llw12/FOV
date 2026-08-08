@@ -114,11 +114,65 @@ RaptorQ source symbol count 最大为 56,403。这是当前 pyraptorq 所封装 
 
 QR ECC 处理帧内错误；CRC32 将损坏 packet 转为 erasure；RaptorQ 处理帧间丢失；SHA256 提供文件级最终确认。每个 symbol 只发送一次，不再使用旧 `REPEAT=3`。
 
+## 自动参数扫描
+
+`scripts/scan_params.py` 会批量生成 FOV 视频、做本地解码校验，再用 FFmpeg 进行一次可重复的“平台式”H.264 二次压缩并再次解码。脚本把每一步日志和结果保存在独立 run 目录，并生成用于后续人工平台验证的候选列表。
+
+默认 targeted 扫描覆盖当前最有价值的参数区间：720p 的 200/240/280 B，以及 1080p 的 400/500/600/700 B，默认 repair=20%。
+
+```powershell
+python .\scripts\scan_params.py --input .\test.zip
+```
+
+扫描结束会生成：
+
+```text
+runs/scan-YYYYMMDD-HHMMSS/
+  config.json
+  results.csv
+  results.json
+  summary.md
+  manual_queue.csv
+  cases/<case>/
+    source.mp4
+    encode.log
+    local_decode.log
+    sim_ffmpeg.log
+    sim_decode.log
+```
+
+`source.mp4` 始终保留，供人工上传平台验证；`manual_queue.csv` 只列出本地和模拟压缩都成功的组合，并按有效文件吞吐量从高到低排序。人工验证时上传 `source.mp4`，不要上传 `sim_platform.mp4`。
+
+可一次扫描多个 repair ratio：
+
+```powershell
+python .\scripts\scan_params.py --repairs 0.10 0.20 0.30
+```
+
+也可以只验证指定组合；`--case` 可重复：
+
+```powershell
+python .\scripts\scan_params.py `
+  --case 1920x1080:500:0.20 `
+  --case 1920x1080:600:0.20 `
+  --case 1920x1080:700:0.30
+```
+
+默认模拟 profile 使用 H.264 High、yuv420p、CFR、GOP 250、3 个 B-frame，并以约 900 kbps（720p）/1500 kbps（1080p）做 constrained-VBR 二次压缩。它只是可重复的 Bilibili-like 压缩近似，并不等同于平台私有转码器。得到更多真实平台 `ffprobe` 数据后，应使用参数覆盖来校准模拟码率：
+
+```powershell
+python .\scripts\scan_params.py `
+  --sim-bitrate-720 900 `
+  --sim-bitrate-1080 1800
+```
+
+默认模拟 MP4 在完成验证后删除以节省空间；加 `--keep-sim-videos` 可保留。加 `--verbose` 会在保存日志的同时把 FFmpeg/decoder 子进程输出实时打印到终端。
+
 ## 测试
 
 ```powershell
-python -m compileall fov.py file2video.py video2file.py tests
+python -m compileall fov.py file2video.py video2file.py scripts tests
 python -m pytest -q
 ```
 
-单元测试不依赖 FFmpeg 或视频平台，覆盖 packet、CRC、RaptorQ 随机丢失、重复 symbol、多 block、固定 META、布局推导、metadata 边界、META 晚到、冲突、多文件、惰性生成和 Windows DLL handle。
+单元测试不依赖 FFmpeg 或视频平台，覆盖 packet、CRC、RaptorQ 随机丢失、重复 symbol、多 block、固定 META、布局推导、metadata 边界、META 晚到、冲突、多文件、惰性生成、Windows DLL handle，以及参数扫描脚本的矩阵/日志解析 helper。
