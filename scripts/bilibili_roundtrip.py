@@ -1,395 +1,408 @@
-"""Upload an FOV source video through Bilibili Open Platform, wait for review,
-download the published rendition, and run the FOV decoder.
+"""Automate an FOV round trip through a normal Bilibili account via biliup.
 
-Upload/review polling uses Bilibili's documented Open Platform APIs. Download is
-performed with yt-dlp because the Open Platform does not expose a documented video
-rendition download API. Use this only for videos/accounts you are authorized to use
-and follow Bilibili's current platform rules.
+Use only accounts/videos you are authorized to operate. biliup relies on non-public
+client/web APIs, so this integration may need updates when Bilibili changes them.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, BinaryIO
-
-import cv2
-import requests
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MEMBER_BASE = "https://member.bilibili.com"
-UPOS_BASE = "https://openupos.bilivideo.com"
-SMALL_UPLOAD_LIMIT = 100 * 1024 * 1024
-MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
-PART_SIZE = 8 * 1024 * 1024
 DEFAULT_DOWNLOAD_FORMAT = (
     "bestvideo[height<=720][vcodec^=avc1]/"
     "bestvideo[height<=720]/best[height<=720]/best"
 )
-
-
-class BilibiliOpenApiError(RuntimeError):
-    def __init__(self, operation: str, payload: Any) -> None:
-        if isinstance(payload, dict):
-            code = payload.get("code")
-            message = payload.get("message")
-            request_id = payload.get("request_id")
-            detail = f"code={code}, message={message}, request_id={request_id}"
-        else:
-            detail = repr(payload)
-        super().__init__(f"Bilibili Open API {operation} failed: {detail}")
+BVID_RE = re.compile(r"\b(BV[0-9A-Za-z]{10,})\b")
+UPLOAD_BVID_RE = re.compile(r'"bvid"\s*:\s*String\("(?P<bvid>BV[0-9A-Za-z]+)"\)')
+UPLOAD_AID_RE = re.compile(r'"aid"\s*:\s*Number\((?P<aid>\d+)\)')
 
 
 @dataclass(frozen=True)
-class Credentials:
-    client_id: str
-    app_secret: str
-    access_token: str
+class UploadIdentity:
+    bvid: str
+    aid: int | None = None
 
 
 @dataclass(frozen=True)
-class ArchiveState:
-    outcome: str  # open | failed | waiting
-    state: int | None
-    state_desc: str
-    reject_reason: str
-    share_url: str
+class CommandResult:
+    returncode: int
+    output: str
+    elapsed_s: float
 
 
-def compact_json(value: dict[str, Any]) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+def parse_upload_identity(text: str) -> UploadIdentity | None:
+    match = UPLOAD_BVID_RE.search(text) or BVID_RE.search(text)
+    if not match:
+        return None
+    bvid = match.groupdict().get("bvid") or match.group(1)
+    aid_match = UPLOAD_AID_RE.search(text)
+    aid = int(aid_match.group("aid")) if aid_match else None
+    return UploadIdentity(bvid, aid)
 
 
-def build_signed_headers(
-    credentials: Credentials,
-    *,
-    body_bytes: bytes = b"",
-    content_type: str | None = "application/json",
-    timestamp: int | None = None,
-    nonce: str | None = None,
-) -> dict[str, str]:
-    """Build Bilibili Open Platform v2 HMAC-SHA256 headers.
-
-    For binary video uploads and cover multipart uploads, callers pass an empty
-    body_bytes because the documented content MD5 excludes file content.
-    """
-    timestamp_value = str(timestamp if timestamp is not None else int(time.time()))
-    nonce_value = nonce or uuid.uuid4().hex
-    x_headers = {
-        "x-bili-accesskeyid": credentials.client_id,
-        "x-bili-content-md5": hashlib.md5(body_bytes).hexdigest(),
-        "x-bili-signature-method": "HMAC-SHA256",
-        "x-bili-signature-nonce": nonce_value,
-        "x-bili-signature-version": "2.0",
-        "x-bili-timestamp": timestamp_value,
-    }
-    canonical = "\n".join(f"{key}:{x_headers[key]}" for key in sorted(x_headers))
-    signature = hmac.new(
-        credentials.app_secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
-    headers = {
-        "Accept": "application/json",
-        "Access-Token": credentials.access_token,
-        "Authorization": signature,
-        **x_headers,
-    }
-    if content_type is not None:
-        headers["Content-Type"] = content_type
-    return headers
+def parse_list_entries(text: str) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        match = re.match(r"^\s*(BV[0-9A-Za-z]{10,})\s+(.*\S)\s*$", line)
+        if match:
+            entries.append((match.group(1), match.group(2)))
+    return entries
 
 
-def classify_archive(payload: dict[str, Any]) -> ArchiveState:
-    data = payload.get("data") or {}
-    addit = data.get("addit_info") or {}
-    video_info = data.get("video_info") or {}
-    state = addit.get("state")
-    try:
-        state_int = int(state) if state is not None else None
-    except (TypeError, ValueError):
-        state_int = None
-    state_desc = str(addit.get("state_desc") or "")
-    reject_reason = str(addit.get("reject_reason") or "")
-    share_url = str(video_info.get("share_url") or "")
-
-    if state_int == 0 or "开放浏览" in state_desc or "已发布" in state_desc:
-        return ArchiveState("open", state_int, state_desc, reject_reason, share_url)
-
-    failed_words = ("退回", "失败", "删除", "封禁", "锁定", "不通过", "拒绝")
-    if reject_reason or any(word in state_desc for word in failed_words):
-        return ArchiveState("failed", state_int, state_desc, reject_reason, share_url)
-
-    return ArchiveState("waiting", state_int, state_desc, reject_reason, share_url)
+def bvid_in_list(text: str, bvid: str) -> bool:
+    return any(value == bvid for value, _ in parse_list_entries(text))
 
 
-class BilibiliClient:
-    def __init__(self, credentials: Credentials) -> None:
-        self.credentials = credentials
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "FOV-Bilibili-Roundtrip/1.0"})
+def find_bvid_by_title(text: str, title: str) -> str | None:
+    for bvid, remainder in parse_list_entries(text):
+        if title in remainder:
+            return bvid
+    return None
 
-    def _json_request(
-        self,
-        method: str,
-        url: str,
-        *,
-        operation: str,
-        body: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-        timeout: tuple[int, int] = (20, 120),
-    ) -> dict[str, Any]:
-        body_bytes = compact_json(body) if body is not None else b""
-        response = self.session.request(
-            method,
-            url,
-            params=params,
-            data=body_bytes if body is not None else None,
-            headers=build_signed_headers(self.credentials, body_bytes=body_bytes),
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 0:
-            raise BilibiliOpenApiError(operation, payload)
-        return payload
 
-    def video_init(self, filename: str, *, small: bool) -> str:
-        payload = self._json_request(
-            "POST",
-            f"{MEMBER_BASE}/arcopen/fn/archive/video/init",
-            operation="video init",
-            body={"name": filename, "utype": "1" if small else "0"},
-        )
-        token = (payload.get("data") or {}).get("upload_token")
-        if not token:
-            raise BilibiliOpenApiError("video init missing upload_token", payload)
-        return str(token)
+def export_biliup_cookies_to_netscape(source: Path, target: Path) -> int:
+    """Convert biliup LoginInfo.cookie_info.cookies to a temporary yt-dlp cookie jar."""
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    cookies = (payload.get("cookie_info") or {}).get("cookies") or []
+    if not isinstance(cookies, list) or not cookies:
+        raise ValueError("biliup cookie file has no cookie_info.cookies entries")
 
-    def _upload_binary(
-        self,
-        url: str,
-        source: bytes | BinaryIO,
-        *,
-        operation: str,
-        params: dict[str, Any],
-    ) -> dict[str, Any]:
-        response = self.session.post(
-            url,
-            params=params,
-            data=source,
-            headers=build_signed_headers(self.credentials, body_bytes=b""),
-            timeout=(20, 300),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 0:
-            raise BilibiliOpenApiError(operation, payload)
-        return payload
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Temporary FOV export from biliup cookies.json",
+    ]
+    count = 0
+    for item in cookies:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        value = str(item.get("value") or "")
+        if not name or any(ch in name + value for ch in "\t\r\n"):
+            continue
 
-    def upload_small_video(self, video_path: Path, upload_token: str) -> None:
-        with video_path.open("rb") as stream:
-            self._upload_binary(
-                f"{UPOS_BASE}/video/v2/upload",
-                stream,
-                operation="small video upload",
-                params={"upload_token": upload_token},
+        domain = str(item.get("domain") or ".bilibili.com")
+        if domain == "bilibili.com":
+            domain = ".bilibili.com"
+        path = str(item.get("path") or "/")
+        secure = "TRUE" if bool(item.get("secure", True)) else "FALSE"
+        try:
+            expires = max(0, int(float(item.get("expires", 0))))
+        except (TypeError, ValueError):
+            expires = 0
+
+        lines.append(
+            "\t".join(
+                [
+                    domain,
+                    "TRUE" if domain.startswith(".") else "FALSE",
+                    path,
+                    secure,
+                    str(expires),
+                    name,
+                    value,
+                ]
             )
+        )
+        count += 1
 
-    def upload_parts(self, video_path: Path, upload_token: str) -> int:
-        part_number = 0
-        with video_path.open("rb") as stream:
-            while True:
-                chunk = stream.read(PART_SIZE)
-                if not chunk:
-                    break
-                part_number += 1
-                print(f"  upload part {part_number} ({len(chunk) / 1024 / 1024:.2f} MiB)")
-                self._upload_binary(
-                    f"{UPOS_BASE}/video/v2/part/upload",
-                    chunk,
-                    operation=f"video part {part_number} upload",
-                    params={"upload_token": upload_token, "part_number": part_number},
+    if not count:
+        raise ValueError("biliup cookie file has no usable cookies")
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return count
+
+
+def parse_decoder_output(text: str) -> dict[str, Any]:
+    def metric(label: str) -> int | None:
+        match = re.search(
+            rf"^\s*{re.escape(label)}:\s*(\d+)\s*$", text, re.MULTILINE
+        )
+        return int(match.group(1)) if match else None
+
+    def text_metric(label: str) -> str | None:
+        match = re.search(
+            rf"^\s*{re.escape(label)}:\s*(.*?)\s*$", text, re.MULTILINE
+        )
+        return match.group(1) if match else None
+
+    failed = text_metric("failed frame indices (0-based)")
+    failed_indices = (
+        []
+        if not failed or failed == "-"
+        else [int(value.strip()) for value in failed.split(",") if value.strip()]
+    )
+
+    blocks: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    labels = {
+        "K": "k",
+        "N": "n",
+        "received unique": "received_unique",
+        "received source": "received_source",
+        "received repair": "received_repair",
+    }
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        block_match = re.fullmatch(r"Block\s+(\d+):", line)
+        if block_match:
+            if current is not None:
+                blocks.append(current)
+            current = {"block_id": int(block_match.group(1))}
+            continue
+        if current is None:
+            continue
+
+        matched = False
+        for label, key in labels.items():
+            value_match = re.fullmatch(rf"{re.escape(label)}:\s*(\d+)", line)
+            if value_match:
+                current[key] = int(value_match.group(1))
+                matched = True
+                break
+        if not matched:
+            decoded_match = re.fullmatch(r"decoded at frame:\s*(\d+|unknown)", line)
+            if decoded_match:
+                value = decoded_match.group(1)
+                current["decoded_at_frame"] = (
+                    None if value == "unknown" else int(value)
                 )
-        return part_number
+    if current is not None:
+        blocks.append(current)
 
-    def complete_parts(self, upload_token: str) -> None:
-        self._json_request(
-            "POST",
-            f"{MEMBER_BASE}/arcopen/fn/archive/video/complete",
-            operation="video complete",
-            params={"upload_token": upload_token},
+    original_sha = text_metric("Original SHA256")
+    recovered_sha = text_metric("Recovered SHA256")
+    return {
+        "total_frames": metric("Total frames"),
+        "qr_decoded": metric("decoded"),
+        "qr_failed": metric("failed"),
+        "failed_frame_indices": failed_indices,
+        "failed_frame_indices_truncated": (
+            text_metric("failed frame indices truncated") == "yes"
+        ),
+        "valid_meta": metric("valid META"),
+        "crc_failed": metric("CRC failed"),
+        "post_decode_symbols": metric("post-decode symbols"),
+        "blocks": blocks,
+        "original_sha256": original_sha,
+        "recovered_sha256": recovered_sha,
+        "sha256_match": bool(
+            original_sha and recovered_sha and original_sha == recovered_sha
+        ),
+        "file_fully_recovered": "[OK] File fully recovered" in text,
+    }
+
+
+def run_logged(
+    command: list[str],
+    log_path: Path,
+    *,
+    append: bool = False,
+    echo: bool = True,
+) -> CommandResult:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    lines: list[str] = []
+    with log_path.open(
+        "a" if append else "w", encoding="utf-8", errors="replace"
+    ) as log:
+        if append and log.tell():
+            log.write("\n")
+        log.write("$ " + subprocess.list2cmdline(command) + "\n\n")
+        process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
-
-    def upload_cover(self, cover_path: Path) -> str:
-        headers = build_signed_headers(
-            self.credentials,
-            body_bytes=b"",
-            content_type=None,  # requests adds multipart/form-data with its boundary.
-        )
-        with cover_path.open("rb") as stream:
-            response = self.session.post(
-                f"{MEMBER_BASE}/arcopen/fn/archive/cover/upload",
-                files={"file": (cover_path.name, stream, "image/jpeg")},
-                headers=headers,
-                timeout=(20, 120),
-            )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 0:
-            raise BilibiliOpenApiError("cover upload", payload)
-        url = (payload.get("data") or {}).get("url")
-        if not url:
-            raise BilibiliOpenApiError("cover upload missing url", payload)
-        return str(url)
-
-    def submit_archive(
-        self,
-        upload_token: str,
-        *,
-        title: str,
-        cover_url: str,
-        tid: int,
-        tag: str,
-        desc: str,
-    ) -> str:
-        body = {
-            "title": title,
-            "cover": cover_url,
-            "tid": tid,
-            "tag": tag,
-            "desc": desc,
-            "copyright": 1,
-            "no_reprint": 1,
-        }
-        payload = self._json_request(
-            "POST",
-            f"{MEMBER_BASE}/arcopen/fn/archive/add-by-utoken",
-            operation="archive submit",
-            body=body,
-            params={"upload_token": upload_token},
-        )
-        resource_id = (payload.get("data") or {}).get("resource_id")
-        if not resource_id:
-            raise BilibiliOpenApiError("archive submit missing resource_id", payload)
-        return str(resource_id)
-
-    def archive_view(self, resource_id: str) -> dict[str, Any]:
-        return self._json_request(
-            "GET",
-            f"{MEMBER_BASE}/arcopen/fn/archive/view",
-            operation="archive view",
-            params={"resource_id": resource_id},
-        )
-
-    def delete_archive(self, resource_id: str) -> None:
-        self._json_request(
-            "POST",
-            f"{MEMBER_BASE}/arcopen/fn/archive/delete",
-            operation="archive delete",
-            body={"resource_id": resource_id},
-        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            lines.append(line)
+            log.write(line)
+            log.flush()
+            if echo:
+                print(line, end="")
+        returncode = process.wait()
+    return CommandResult(
+        returncode, "".join(lines), time.perf_counter() - started
+    )
 
 
-def make_cover(video_path: Path, target: Path) -> None:
-    capture = cv2.VideoCapture(str(video_path))
-    try:
-        ok, frame = capture.read()
-    finally:
-        capture.release()
-    if not ok or frame is None:
-        raise RuntimeError(f"cannot read first frame for cover: {video_path}")
-
-    target_ratio = 1146 / 717
-    height, width = frame.shape[:2]
-    ratio = width / height
-    if ratio > target_ratio:
-        crop_width = round(height * target_ratio)
-        left = (width - crop_width) // 2
-        frame = frame[:, left:left + crop_width]
-    elif ratio < target_ratio:
-        crop_height = round(width / target_ratio)
-        top = (height - crop_height) // 2
-        frame = frame[top:top + crop_height, :]
-    resized = cv2.resize(frame, (1146, 717), interpolation=cv2.INTER_AREA)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(target), resized, [int(cv2.IMWRITE_JPEG_QUALITY), 90]):
-        raise RuntimeError(f"cannot write cover: {target}")
+def resolve_executable(value: str) -> str:
+    path = Path(value).expanduser()
+    if path.is_file():
+        return str(path.resolve())
+    found = shutil.which(value)
+    if found:
+        return found
+    raise SystemExit(f"executable not found: {value}")
 
 
-def wait_for_open(
-    client: BilibiliClient,
-    resource_id: str,
+def biliup_base(executable: str, cookies: Path) -> list[str]:
+    return [executable, "-u", str(cookies)]
+
+
+def build_upload_command(
+    executable: str,
+    cookies: Path,
+    video: Path,
+    *,
+    title: str,
+    tid: int,
+    tag: str,
+    desc: str,
+    copyright_value: int,
+    submit: str,
+    limit: int,
+    cover: Path | None,
+) -> list[str]:
+    command = biliup_base(executable, cookies) + [
+        "upload",
+        str(video),
+        "--title",
+        title,
+        "--tid",
+        str(tid),
+        "--tag",
+        tag,
+        "--desc",
+        desc,
+        "--copyright",
+        str(copyright_value),
+        "--submit",
+        submit,
+        "--limit",
+        str(limit),
+    ]
+    if cover:
+        command += ["--cover", str(cover)]
+    return command
+
+
+def list_status(
+    executable: str,
+    cookies: Path,
+    flag: str,
+    max_pages: int,
+    log_path: Path,
+) -> CommandResult:
+    return run_logged(
+        biliup_base(executable, cookies)
+        + ["list", flag, "--max-pages", str(max_pages)],
+        log_path,
+        append=True,
+        echo=False,
+    )
+
+
+def recover_bvid_by_title(
+    executable: str,
+    cookies: Path,
+    title: str,
+    max_pages: int,
+    log_path: Path,
+) -> str | None:
+    for flag in ("--is-pubing", "--pubed", "--not-pubed"):
+        result = list_status(executable, cookies, flag, max_pages, log_path)
+        if result.returncode == 0:
+            found = find_bvid_by_title(result.output, title)
+            if found:
+                return found
+    return None
+
+
+def wait_for_published(
+    executable: str,
+    cookies: Path,
+    bvid: str,
     *,
     poll_interval: float,
     timeout: float,
-) -> tuple[ArchiveState, list[dict[str, Any]]]:
+    max_pages: int,
+    log_path: Path,
+    on_poll: Any | None = None,
+) -> list[dict[str, Any]]:
     started = time.monotonic()
     history: list[dict[str, Any]] = []
-    last_label = ""
+    poll_number = 0
+
     while True:
-        payload = client.archive_view(resource_id)
-        state = classify_archive(payload)
-        entry = {
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
-            "state": state.state,
-            "state_desc": state.state_desc,
-            "reject_reason": state.reject_reason,
-        }
-        history.append(entry)
-        label = f"state={state.state} {state.state_desc}".strip()
-        if label != last_label:
-            print(f"  review: {label or 'unknown'}")
-            last_label = label
-        if state.outcome == "open":
-            return state, history
-        if state.outcome == "failed":
-            reason = state.reject_reason or state.state_desc or str(state.state)
-            raise RuntimeError(f"Bilibili review failed: {reason}")
+        poll_number += 1
+        checked_at = datetime.now().isoformat(timespec="seconds")
+        published = list_status(
+            executable, cookies, "--pubed", max_pages, log_path
+        )
+        if published.returncode == 0 and bvid_in_list(published.output, bvid):
+            history.append(
+                {"checked_at": checked_at, "poll": poll_number, "state": "published"}
+            )
+            if on_poll:
+                on_poll(history)
+            print(f"  review: published ({bvid})")
+            return history
+
+        rejected = list_status(
+            executable, cookies, "--not-pubed", max_pages, log_path
+        )
+        if rejected.returncode == 0 and bvid_in_list(rejected.output, bvid):
+            history.append(
+                {"checked_at": checked_at, "poll": poll_number, "state": "not_pubed"}
+            )
+            if on_poll:
+                on_poll(history)
+            raise RuntimeError(f"Bilibili archive {bvid} entered --not-pubed")
+
+        state = (
+            "poll_error"
+            if published.returncode or rejected.returncode
+            else "waiting"
+        )
+        history.append(
+            {
+                "checked_at": checked_at,
+                "poll": poll_number,
+                "state": state,
+                "pubed_command_ok": published.returncode == 0,
+                "not_pubed_command_ok": rejected.returncode == 0,
+            }
+        )
+        if on_poll:
+            on_poll(history)
+
         if time.monotonic() - started >= timeout:
-            raise TimeoutError(f"Bilibili review did not finish within {timeout:.0f}s; last={label}")
+            raise TimeoutError(
+                f"Bilibili review did not finish within {timeout:.0f}s for {bvid}"
+            )
+        print(f"  review: {state}; retry in {poll_interval:g}s")
         time.sleep(poll_interval)
 
 
-def run_logged(command: list[str], log_path: Path) -> subprocess.CompletedProcess[str]:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    print("$ " + subprocess.list2cmdline(command))
-    completed = subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    log_path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    return completed
-
-
 def download_with_ytdlp(
-    share_url: str,
+    url: str,
     target: Path,
     *,
     format_selector: str,
-    cookies_from_browser: str | None,
+    browser: str | None,
     cookies: Path | None,
     retries: int,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
+    output_template = target.with_name(target.stem + ".%(ext)s")
     for attempt in range(1, retries + 1):
         target.unlink(missing_ok=True)
         command = [
@@ -404,38 +417,43 @@ def download_with_ytdlp(
             "--remux-video",
             "mp4",
             "-o",
-            str(target),
+            str(output_template),
         ]
-        if cookies_from_browser:
-            command += ["--cookies-from-browser", cookies_from_browser]
+        if browser:
+            command += ["--cookies-from-browser", browser]
         if cookies:
             command += ["--cookies", str(cookies)]
-        command.append(share_url)
-        completed = run_logged(command, target.parent / f"download_attempt_{attempt}.log")
-        if completed.returncode == 0 and target.is_file() and target.stat().st_size > 0:
+        command.append(url)
+
+        result = run_logged(
+            command, target.parent / f"download_attempt_{attempt}.log"
+        )
+        if result.returncode == 0 and target.is_file() and target.stat().st_size:
             return
         if attempt < retries:
             wait_seconds = min(60, 10 * attempt)
-            print(f"  download attempt {attempt} failed; retry in {wait_seconds}s")
+            print(
+                f"  download attempt {attempt} failed; retry in {wait_seconds}s"
+            )
             time.sleep(wait_seconds)
     raise RuntimeError(f"yt-dlp failed after {retries} attempts")
 
 
 def ffprobe_video(path: Path) -> dict[str, Any]:
-    command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=codec_name,profile,width,height,pix_fmt,bit_rate,nb_frames,avg_frame_rate:format=duration,size,bit_rate",
-        "-of",
-        "json",
-        str(path),
-    ]
     completed = subprocess.run(
-        command,
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,profile,width,height,pix_fmt,bit_rate,nb_frames,avg_frame_rate:"
+            "format=duration,size,bit_rate",
+            "-of",
+            "json",
+            str(path),
+        ],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -446,49 +464,88 @@ def ffprobe_video(path: Path) -> dict[str, Any]:
     return json.loads(completed.stdout)
 
 
-def decode_downloaded(video_path: Path, run_dir: Path) -> None:
+def decode_downloaded(video: Path, run_dir: Path) -> dict[str, Any]:
     recovered = run_dir / "recovered"
     shutil.rmtree(recovered, ignore_errors=True)
-    recovered.mkdir(parents=True, exist_ok=True)
-    completed = run_logged(
-        [sys.executable, "video2file.py", str(video_path), str(recovered)],
+    recovered.mkdir(parents=True)
+    result = run_logged(
+        [sys.executable, "video2file.py", str(video), str(recovered)],
         run_dir / "decode.log",
     )
-    if completed.returncode != 0:
-        raise RuntimeError(f"FOV decode failed; see {run_dir / 'decode.log'}")
+    stats = parse_decoder_output(result.output)
+    stats["returncode"] = result.returncode
+    if (
+        result.returncode != 0
+        or not stats["sha256_match"]
+        or not stats["file_fully_recovered"]
+    ):
+        raise RuntimeError(
+            f"FOV decode verification failed; see {run_dir / 'decode.log'}"
+        )
+    return stats
 
 
-def env_or_arg(value: str | None, env_name: str) -> str:
-    resolved = value or os.environ.get(env_name, "")
-    if not resolved:
-        raise SystemExit(f"missing credential: pass the option or set {env_name}")
-    return resolved
+def write_result(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Upload an FOV video to Bilibili, wait for review, download the published rendition, and decode it"
+        description=(
+            "Upload FOV with biliup, wait for publication, download the platform "
+            "rendition, and decode it"
+        )
     )
     parser.add_argument("video", type=Path)
-    parser.add_argument("--client-id", default=None, help="or BILI_CLIENT_ID")
-    parser.add_argument("--app-secret", default=None, help="or BILI_APP_SECRET")
-    parser.add_argument("--access-token", default=None, help="or BILI_ACCESS_TOKEN")
-    parser.add_argument("--tid", type=int, default=None, help="Bilibili archive category id; or BILI_TID")
-    parser.add_argument("--title", default=None)
-    parser.add_argument("--tag", default="FOV,实验")
     parser.add_argument(
-        "--desc",
-        default="FOV 数据经二维码视频传输的鲁棒性实验；本稿件仅用于本人自动回环测试。",
+        "--biliup",
+        default=os.environ.get("BILIUP_EXE", "biliup"),
+        help="biliup executable path/name; or BILIUP_EXE",
     )
-    parser.add_argument("--cover", type=Path, default=None, help="optional jpeg/png cover; otherwise first frame is used")
+    parser.add_argument(
+        "--biliup-cookies",
+        type=Path,
+        default=(
+            Path(os.environ["BILIUP_COOKIES"])
+            if os.environ.get("BILIUP_COOKIES")
+            else None
+        ),
+        help="biliup cookies.json; or BILIUP_COOKIES",
+    )
+    parser.add_argument(
+        "--tid",
+        type=int,
+        default=(
+            int(os.environ["BILI_TID"])
+            if os.environ.get("BILI_TID")
+            else None
+        ),
+        help="Bilibili category id; or BILI_TID",
+    )
+    parser.add_argument("--title", default=None)
+    parser.add_argument("--tag", default="FOV,二维码,测试")
+    parser.add_argument("--desc", default="FOV 视频信道自动化实验")
+    parser.add_argument("--copyright", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--submit",
+        choices=("app", "web", "b-cut-android"),
+        default="app",
+    )
+    parser.add_argument("--limit", type=int, default=3)
+    parser.add_argument("--cover", type=Path, default=None)
     parser.add_argument("--poll-interval", type=float, default=30.0)
-    parser.add_argument("--approval-timeout", type=float, default=2 * 60 * 60)
+    parser.add_argument("--approval-timeout", type=float, default=7200.0)
+    parser.add_argument("--status-max-pages", type=int, default=3)
     parser.add_argument("--download-format", default=DEFAULT_DOWNLOAD_FORMAT)
-    parser.add_argument("--cookies-from-browser", default=None, help="yt-dlp browser name, e.g. chrome or edge")
-    parser.add_argument("--cookies", type=Path, default=None, help="Netscape cookies.txt for yt-dlp")
+    parser.add_argument("--cookies-from-browser", default=None)
+    parser.add_argument("--yt-dlp-cookies", type=Path, default=None)
+    parser.add_argument("--anonymous-download", action="store_true")
     parser.add_argument("--download-retries", type=int, default=5)
-    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "runs")
-    parser.add_argument("--delete-after", action="store_true", help="delete the Bilibili archive after successful decode")
+    parser.add_argument(
+        "--output-root", type=Path, default=REPO_ROOT / "runs"
+    )
     args = parser.parse_args()
 
     if shutil.which("ffprobe") is None:
@@ -496,127 +553,214 @@ def main() -> None:
     try:
         import yt_dlp  # noqa: F401
     except ImportError as exc:
-        raise SystemExit("yt-dlp is required; run: python -m pip install -r requirements.txt") from exc
+        raise SystemExit(
+            "yt-dlp is required; run: python -m pip install -r requirements.txt"
+        ) from exc
 
-    video_path = args.video.resolve()
-    if not video_path.is_file():
-        raise SystemExit(f"video not found: {video_path}")
-    size = video_path.stat().st_size
-    if size <= 0 or size > MAX_UPLOAD_BYTES:
-        raise SystemExit(f"video size must be within 1..{MAX_UPLOAD_BYTES} bytes")
+    executable = resolve_executable(args.biliup)
+    if args.biliup_cookies is None:
+        raise SystemExit("missing --biliup-cookies (or BILIUP_COOKIES)")
+    biliup_cookies = args.biliup_cookies.expanduser().resolve()
+    if not biliup_cookies.is_file():
+        raise SystemExit(f"biliup cookie file not found: {biliup_cookies}")
+
+    video = args.video.expanduser().resolve()
+    if not video.is_file():
+        raise SystemExit(f"video not found: {video}")
+    if video.stat().st_size <= 0:
+        raise SystemExit("video is empty")
+    if args.tid is None:
+        raise SystemExit("missing --tid (or BILI_TID)")
+    if args.limit <= 0 or args.status_max_pages <= 0:
+        raise SystemExit("--limit and --status-max-pages must be positive")
     if args.poll_interval < 10:
         raise SystemExit("--poll-interval must be >= 10 seconds")
     if args.approval_timeout <= 0 or args.download_retries <= 0:
         raise SystemExit("timeout/retry values must be positive")
 
-    tid_value = args.tid if args.tid is not None else os.environ.get("BILI_TID")
-    if tid_value in (None, ""):
-        raise SystemExit("missing --tid (or BILI_TID); use a category id granted/available to your Open Platform app")
-    tid = int(tid_value)
-
-    credentials = Credentials(
-        client_id=env_or_arg(args.client_id, "BILI_CLIENT_ID"),
-        app_secret=env_or_arg(args.app_secret, "BILI_APP_SECRET"),
-        access_token=env_or_arg(args.access_token, "BILI_ACCESS_TOKEN"),
+    cover = args.cover.expanduser().resolve() if args.cover else None
+    if cover is not None and not cover.is_file():
+        raise SystemExit(f"cover not found: {cover}")
+    yt_dlp_cookies = (
+        args.yt_dlp_cookies.expanduser().resolve()
+        if args.yt_dlp_cookies
+        else None
     )
+    if yt_dlp_cookies is not None and not yt_dlp_cookies.is_file():
+        raise SystemExit(
+            f"yt-dlp cookie file not found: {yt_dlp_cookies}"
+        )
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = args.output_root.resolve() / f"bilibili-{timestamp}"
+    run_dir = (
+        args.output_root.expanduser().resolve() / f"bilibili-{timestamp}"
+    )
     run_dir.mkdir(parents=True, exist_ok=False)
-    title = args.title or f"FOV roundtrip {timestamp}"
-    cover_path = args.cover.resolve() if args.cover else run_dir / "cover.jpg"
-    if not args.cover:
-        make_cover(video_path, cover_path)
-    elif not cover_path.is_file():
-        raise SystemExit(f"cover not found: {cover_path}")
+    result_path = run_dir / "result.json"
+    review_log = run_dir / "review.log"
+    title = (args.title or f"FOV auto {timestamp} {video.stem}")[:80]
 
     result: dict[str, Any] = {
-        "source_video": str(video_path),
-        "source_video_bytes": size,
+        "source_video": str(video),
+        "source_video_bytes": video.stat().st_size,
         "title": title,
-        "tid": tid,
+        "tid": args.tid,
+        "submit": args.submit,
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "biliup_executable": executable,
     }
-    result_path = run_dir / "result.json"
-    client = BilibiliClient(credentials)
-    resource_id: str | None = None
+    write_result(result_path, result)
 
+    bvid: str | None = None
+    temporary_cookie: Path | None = None
     try:
-        small = size <= SMALL_UPLOAD_LIMIT
-        print(f"[1/6] init upload ({'small' if small else 'multipart'})")
-        upload_token = client.video_init(video_path.name, small=small)
-        result["upload_mode"] = "small" if small else "multipart"
-
-        print("[2/6] upload video")
-        if small:
-            client.upload_small_video(video_path, upload_token)
-        else:
-            result["uploaded_parts"] = client.upload_parts(video_path, upload_token)
-            client.complete_parts(upload_token)
-
-        print("[3/6] upload cover + submit archive")
-        cover_url = client.upload_cover(cover_path)
-        resource_id = client.submit_archive(
-            upload_token,
-            title=title,
-            cover_url=cover_url,
-            tid=tid,
-            tag=args.tag,
-            desc=args.desc,
+        print("[1/6] biliup upload + submit")
+        upload = run_logged(
+            build_upload_command(
+                executable,
+                biliup_cookies,
+                video,
+                title=title,
+                tid=args.tid,
+                tag=args.tag,
+                desc=args.desc,
+                copyright_value=args.copyright,
+                submit=args.submit,
+                limit=args.limit,
+                cover=cover,
+            ),
+            run_dir / "upload.log",
         )
-        result["resource_id"] = resource_id
-        result["cover_url"] = cover_url
-        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"  resource_id: {resource_id}")
+        result["upload_seconds"] = round(upload.elapsed_s, 3)
+        result["upload_returncode"] = upload.returncode
+        if upload.returncode:
+            raise RuntimeError(
+                f"biliup upload failed; see {run_dir / 'upload.log'}"
+            )
 
-        print("[4/6] wait for review")
-        archive_state, history = wait_for_open(
-            client,
-            resource_id,
+        identity = parse_upload_identity(upload.output)
+        if identity is None:
+            print("  upload output had no BVID; falling back to title lookup")
+            fallback = recover_bvid_by_title(
+                executable,
+                biliup_cookies,
+                title,
+                args.status_max_pages,
+                review_log,
+            )
+            if not fallback:
+                raise RuntimeError(
+                    "upload succeeded but BVID could not be discovered"
+                )
+            identity = UploadIdentity(fallback)
+
+        bvid = identity.bvid
+        result.update(
+            {
+                "bvid": bvid,
+                "aid": identity.aid,
+                "share_url": f"https://www.bilibili.com/video/{bvid}",
+            }
+        )
+        write_result(result_path, result)
+        print(f"  bvid: {bvid}")
+
+        print("[2/6] wait for review/publication")
+
+        def persist(history: list[dict[str, Any]]) -> None:
+            result["review_history"] = history
+            write_result(result_path, result)
+
+        history = wait_for_published(
+            executable,
+            biliup_cookies,
+            bvid,
             poll_interval=args.poll_interval,
             timeout=args.approval_timeout,
+            max_pages=args.status_max_pages,
+            log_path=review_log,
+            on_poll=persist,
         )
-        result["review_history"] = history
-        share_url = archive_state.share_url or f"https://www.bilibili.com/video/{resource_id}"
-        result["share_url"] = share_url
-        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"  open: {share_url}")
+        result["published_at"] = history[-1]["checked_at"]
+        write_result(result_path, result)
 
-        print("[5/6] download published rendition")
+        print("[3/6] fetch published archive details")
+        show = run_logged(
+            biliup_base(executable, biliup_cookies) + ["show", bvid],
+            run_dir / "show.log",
+        )
+        result["show_returncode"] = show.returncode
+        write_result(result_path, result)
+
+        print("[4/6] download published rendition")
+        download_cookie = yt_dlp_cookies
+        download_auth = "anonymous"
+        if args.cookies_from_browser:
+            download_auth = f"browser:{args.cookies_from_browser}"
+        elif yt_dlp_cookies:
+            download_auth = "explicit-cookie-file"
+        elif not args.anonymous_download:
+            temp = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".txt",
+                prefix="fov-biliup-",
+                delete=False,
+            )
+            temp.close()
+            temporary_cookie = Path(temp.name)
+            try:
+                cookie_count = export_biliup_cookies_to_netscape(
+                    biliup_cookies, temporary_cookie
+                )
+                download_cookie = temporary_cookie
+                download_auth = f"biliup-cookies:{cookie_count}"
+            except Exception as exc:
+                temporary_cookie.unlink(missing_ok=True)
+                temporary_cookie = None
+                print(
+                    "  warning: cookie conversion failed "
+                    f"({type(exc).__name__}: {exc}); trying anonymous"
+                )
+                download_auth = "anonymous-fallback"
+
+        result["download_auth"] = download_auth
         downloaded = run_dir / "platform.mp4"
         download_with_ytdlp(
-            share_url,
+            result["share_url"],
             downloaded,
             format_selector=args.download_format,
-            cookies_from_browser=args.cookies_from_browser,
-            cookies=args.cookies.resolve() if args.cookies else None,
+            browser=args.cookies_from_browser,
+            cookies=download_cookie,
             retries=args.download_retries,
         )
         result["downloaded_video"] = str(downloaded)
+        result["downloaded_video_bytes"] = downloaded.stat().st_size
         try:
             result["downloaded_ffprobe"] = ffprobe_video(downloaded)
         except Exception as exc:
             result["ffprobe_warning"] = f"{type(exc).__name__}: {exc}"
-        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_result(result_path, result)
 
-        print("[6/6] FOV decode")
-        decode_downloaded(downloaded, run_dir)
+        print("[5/6] FOV decode")
+        result["decode"] = decode_downloaded(downloaded, run_dir)
         result["decode_ok"] = True
+        write_result(result_path, result)
 
-        if args.delete_after:
-            print("[cleanup] delete Bilibili archive")
-            client.delete_archive(resource_id)
-            result["archive_deleted"] = True
-
+        print("[6/6] finish")
         result["finished_at"] = datetime.now().isoformat(timespec="seconds")
-        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_result(result_path, result)
         print(f"[OK] Bilibili roundtrip passed\nResult: {result_path}")
     except BaseException as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["failed_at"] = datetime.now().isoformat(timespec="seconds")
-        if resource_id:
-            result["resource_id"] = resource_id
-        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        if bvid:
+            result["bvid"] = bvid
+        write_result(result_path, result)
         raise
+    finally:
+        if temporary_cookie is not None:
+            temporary_cookie.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
