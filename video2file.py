@@ -18,7 +18,6 @@ from pyraptorq import Decoder
 from fov import (BlockLayout, MetaPacket, MetadataError, PacketError, SymbolPacket, file_id_from_sha256,
                  make_raptorq_engine, parse_packet, safe_filename, sha256_file, validate_metadata)
 
-ROI_SIZE = 700
 PREMETA_MAX_SYMBOLS = 4_096
 PREMETA_MAX_BYTES = 16 * 1024 * 1024
 PREMETA_MAX_FILE_IDS = 4
@@ -179,7 +178,9 @@ class StreamingDecodeSession:
 
 def decode_qr(frame) -> str | None:
     height, width = frame.shape[:2]
-    size = min(ROI_SIZE, height, width)
+    # FOV centers every QR in the frame. Use the full short edge so decoding
+    # automatically follows the video resolution instead of assuming 700 px.
+    size = min(height, width)
     roi = frame[(height - size) // 2:(height + size) // 2, (width - size) // 2:(width + size) // 2]
     candidates = [roi, cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)]
     gray = candidates[-1]
