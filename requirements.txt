@@ -4,5 +4,4 @@ opencv-python
 zxing-cpp
 numpy
 pytest
-requests
 yt-dlp
