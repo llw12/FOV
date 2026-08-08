@@ -11,3 +11,5 @@ smoke_input.bin
 smoke_out/
 smoke_multiblock/
 runs/scan-*/
+cookies.json
+cookies.txt
