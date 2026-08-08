@@ -1,20 +1,22 @@
-"""Encode a file into an FOV v1 QR-frame MP4."""
+"""Encode a file into an FOV v1 QR-frame MP4 without loading it all at once."""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import itertools
 import subprocess
 from pathlib import Path
+from typing import Iterator
 
 import cv2
 import numpy as np
 import qrcode
 from qrcode.constants import ERROR_CORRECT_M
 
-from fov import (FPS, HEIGHT, META_INTERVAL, META_REPEAT, REPAIR_RATIO, SYMBOL_SIZE, WIDTH, build_metadata,
-                 encode_meta, encode_symbol, encoded_symbol_count, encode_block, file_id_from_sha256,
-                 source_symbol_count, split_blocks)
+from fov import (FPS, HEIGHT, INTERLEAVE_WINDOW, META_INTERVAL, META_REPEAT, REPAIR_RATIO, SYMBOL_SIZE, WIDTH,
+                 BlockLayout, build_metadata, create_raptor_encoder, derive_block_layout, encode_meta, encode_symbol,
+                 file_id_from_sha256, iter_file_blocks, make_raptorq_engine, sha256_file)
 
 
 def qr_frame(packet: bytes, width: int, height: int) -> np.ndarray:
@@ -30,56 +32,92 @@ def qr_frame(packet: bytes, width: int, height: int) -> np.ndarray:
     return frame
 
 
-def packet_stream(data: bytes, metadata: dict, file_id: bytes):
+def packet_stream(input_path: Path, metadata: dict, file_id: bytes, engine) -> Iterator[bytes]:
+    """Yield packets in bounded temporal-interleave windows, never all symbols."""
+    layout = derive_block_layout(metadata["original_size"], metadata["block_size"], metadata["symbol_size"], metadata["repair_ratio"])
     meta = encode_meta(file_id, metadata)
-    yield from (meta for _ in range(META_REPEAT))
-    blocks = split_blocks(data, metadata["block_size"])
-    symbols_by_block = []
-    for entry, block in zip(metadata["blocks"], blocks, strict=True):
-        symbols_by_block.append(encode_block(block, metadata["symbol_size"], entry[2]))
-    max_symbols = max(map(len, symbols_by_block))
-    sent = 0
-    for symbol_id in range(max_symbols):
-        for block_id, symbols in enumerate(symbols_by_block):
-            if symbol_id < len(symbols):
-                yield encode_symbol(file_id, block_id, symbol_id, symbols[symbol_id])
-                sent += 1
-                if sent % META_INTERVAL == 0:
-                    yield meta
-    yield from (meta for _ in range(META_REPEAT))
+    yield from itertools.repeat(meta, META_REPEAT)
+    blocks = iter_file_blocks(input_path, metadata["block_size"])
+    sent_symbols = 0
+    while window := list(itertools.islice(blocks, INTERLEAVE_WINDOW)):
+        active = []
+        for block_id, data in window:
+            expected = layout[block_id]
+            if len(data) != expected.data_size:
+                raise RuntimeError("input file changed while encoding")
+            active.append((expected, create_raptor_encoder(data, metadata["symbol_size"], expected, engine)))
+        max_symbols = max(item[0].encoded_symbols for item in active)
+        for symbol_id in range(max_symbols):
+            for block, encoder in active:
+                if symbol_id < block.encoded_symbols:
+                    yield encode_symbol(file_id, block.block_id, symbol_id, encoder.gen_symbol(symbol_id))
+                    sent_symbols += 1
+                    if sent_symbols % META_INTERVAL == 0:
+                        yield meta
+        # Dropping this window releases its source data and native encoders.
+        del active
+    yield from itertools.repeat(meta, META_REPEAT)
+
+
+def estimate_packet_count(layout: list[BlockLayout]) -> tuple[int, int, int]:
+    """Return (total packets, symbols, META packets) using packet_stream's insertion rule."""
+    symbols = sum(block.encoded_symbols for block in layout)
+    inserted_meta = sum(1 for symbol_number in range(1, symbols + 1) if symbol_number % META_INTERVAL == 0)
+    meta_packets = META_REPEAT * 2 + inserted_meta
+    return symbols + meta_packets, symbols, meta_packets
+
+
+def terminate_ffmpeg(process: subprocess.Popen[bytes]) -> None:
+    """Close and stop FFmpeg on any encoder exception without leaving a child behind."""
+    if process.stdin and not process.stdin.closed:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 def encode(input_path: Path, output_path: Path, *, symbol_size: int, repair: float, fps: int, width: int, height: int) -> None:
-    if symbol_size <= 0 or not 0 <= repair <= 5 or min(fps, width, height) <= 0:
-        raise ValueError("invalid video or FEC parameters")
-    data = input_path.read_bytes()
-    metadata = build_metadata(input_path.name, data, symbol_size, repair)
-    file_id = file_id_from_sha256(metadata["sha256"])
-    total_symbols = sum(entry[2] for entry in metadata["blocks"])
-    total_frames = total_symbols + META_REPEAT * 2 + total_symbols // META_INTERVAL
-    print("FOV v1 Encoder\n\n文件:", input_path.name, "\n大小:", len(data), "bytes\nSHA256:", metadata["sha256"])
-    print(f"\nBlock count: {metadata['block_count']}\nSymbol size: {symbol_size}\nRepair ratio: {repair:.0%}")
-    for block_id, entry in enumerate(metadata["blocks"]):
-        print(f"\nBlock {block_id}:\n  data size: {entry[0]}\n  source symbols K: {entry[1]}\n  encoded symbols N: {entry[2]}")
-    print(f"\nVideo:\n  {width}x{height}\n  {fps} fps\n  total frames: {total_frames}\n  duration: {total_frames / fps:.2f}s")
+    if min(fps, width, height) <= 0:
+        raise ValueError("video dimensions and fps must be positive")
+    original_size = input_path.stat().st_size
+    if original_size <= 0:
+        raise ValueError("empty files are not supported by pyraptorq")
+    digest = sha256_file(input_path)
+    metadata = build_metadata(input_path.name, original_size, digest, symbol_size, repair)
+    layout = derive_block_layout(original_size, metadata["block_size"], symbol_size, repair)
+    total_packets, total_symbols, meta_packets = estimate_packet_count(layout)
+    file_id = file_id_from_sha256(digest)
+    print(f"FOV v1 Encoder\n\nFile: {input_path.name}\nSize: {original_size} bytes\nSHA256: {digest}")
+    print(f"\nBlock count: {len(layout)}\nBlock size: {metadata['block_size']}\nSymbol size: {symbol_size}\nRepair ratio: {repair:.0%}\nInterleave window: {INTERLEAVE_WINDOW}")
+    for block in layout:
+        print(f"\nBlock {block.block_id}:\n  data size: {block.data_size}\n  source symbols K: {block.source_symbols}\n  encoded symbols N: {block.encoded_symbols}")
+    print(f"\nSymbols: {total_symbols}\nMETA packets: {meta_packets}\nVideo:\n  {width}x{height}\n  {fps} fps\n  total frames: {total_packets}\n  duration: {total_packets / fps:.2f}s")
     command = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-", "-an", "-c:v", "libx264", "-crf", "15", "-preset", "medium", "-pix_fmt", "yuv420p", str(output_path)]
     try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(command, stdin=subprocess.PIPE)
     except FileNotFoundError as exc:
         raise RuntimeError("ffmpeg not found on PATH") from exc
-    assert process.stdin is not None
     try:
-        for index, packet in enumerate(packet_stream(data, metadata, file_id), 1):
+        assert process.stdin is not None
+        engine = make_raptorq_engine()
+        for index, packet in enumerate(packet_stream(input_path, metadata, file_id, engine), 1):
             process.stdin.write(qr_frame(packet, width, height).tobytes())
             if index % 100 == 0:
-                print(f"\r{index}/{total_frames} frames", end="", flush=True)
+                print(f"\r{index}/{total_packets} frames", end="", flush=True)
         process.stdin.close()
-        stderr = process.stderr.read().decode(errors="replace") if process.stderr else ""
         if process.wait() != 0:
-            raise RuntimeError(f"ffmpeg failed:\n{stderr}")
-    except BrokenPipeError as exc:
-        raise RuntimeError("ffmpeg stopped accepting frames") from exc
-    print(f"\n编码完成: {output_path}")
+            raise RuntimeError(f"ffmpeg exited with code {process.returncode}")
+    except BaseException:
+        terminate_ffmpeg(process)
+        raise
+    print(f"\nEncoding complete: {output_path}")
 
 
 def main() -> None:
