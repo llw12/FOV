@@ -1,123 +1,222 @@
 # Bilibili 自动回环验证
 
-`scripts/bilibili_roundtrip.py` 用于把一个 FOV `source.mp4` 通过哔哩哔哩开放平台投稿，轮询稿件状态直到开放浏览，再下载公开后的平台转码版本，并调用 `video2file.py` 做最终解码/SHA256 验证。
+`scripts/bilibili_roundtrip.py` 用于把一个 FOV `source.mp4` 通过 `biliup` 以普通 B 站账号投稿，等待稿件进入 `--pubed`，再用 `yt-dlp` 下载公开播放版本，并调用 `video2file.py` 完成 QR / RaptorQ / SHA256 验证。
 
-## 能力边界
-
-- **上传与稿件状态查询**：使用哔哩哔哩开放平台文档化的 Open API，包括上传预处理、视频文件上传、封面上传、稿件提交和单稿件查询。
-- **下载平台转码版本**：开放平台当前没有文档化的“下载稿件视频文件”接口，因此脚本使用 `yt-dlp` 下载公开播放版本。这一步不是哔哩哔哩 Open API，可能受登录、地区、账号权益或平台反滥用策略影响。
-- 只应对自己拥有或获得授权的视频/账号使用该脚本，并遵守哔哩哔哩当前开放平台协议和社区规则。FOV 实验稿件应透明说明用途，不用于规避平台审核或内容规则。
+> `biliup` 使用普通账号的客户端/Web 登录态和非公开投稿接口，不是哔哩哔哩开放平台 Open API。接口可能随平台变化而失效；只应用于自己拥有或已获授权的账号和视频，并遵守平台规则。
 
 ## 前置条件
 
-1. 在哔哩哔哩开放平台完成开发者入驻并创建应用。
-2. 为应用申请视频稿件管理相关权限，并让目标 UP 主账号完成授权。
-3. 获取应用的 `client_id`、`app_secret` 和该 UP 主的 `access_token`。
-4. 确认一个该应用可投稿的分区 `tid`。
-5. 安装依赖：
+1. FOV Python 环境已安装：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-系统 `PATH` 还需要 `ffprobe`。FOV 自身编码/解码仍需要 FFmpeg。
-
-## 凭据
-
-推荐只通过环境变量提供，不要把凭据写入仓库：
+2. 系统 `PATH` 中有 FFmpeg / `ffprobe`。
+3. 单独安装 `biliup` Windows CLI，并确认：
 
 ```powershell
-$env:BILI_CLIENT_ID="你的 client_id"
-$env:BILI_APP_SECRET="你的 app_secret"
-$env:BILI_ACCESS_TOKEN="授权 UP 主的 access_token"
-$env:BILI_TID="投稿分区 id"
+E:\Programs\bbup-app\binaries\biliup.exe --version
 ```
 
-也可以用命令行参数 `--client-id`、`--app-secret`、`--access-token` 和 `--tid` 覆盖。
+当前自动化按 `biliup-cli 1.2.x` 的 CLI 形态实现。
+
+4. 首次人工登录一次普通 B 站账号：
+
+```powershell
+E:\Programs\bbup-app\binaries\biliup.exe `
+  -u E:\Programs\bbup-app\cookies.json `
+  login
+```
+
+推荐扫码登录。`cookies.json` 是账号凭据，不要提交到 Git。
 
 ## 基本使用
 
-例如验证一个 1080p / 520B 的 FOV source：
+例如上传一个 1080p / 500B 的 FOV 视频：
 
 ```powershell
 python .\scripts\bilibili_roundtrip.py `
-  .\runs\fov_1080_s520.mp4 `
-  --tid 你的分区ID `
-  --cookies-from-browser edge
+  .\runs\fov_1080_s500.mp4 `
+  --biliup "E:\Programs\bbup-app\binaries\biliup.exe" `
+  --biliup-cookies "E:\Programs\bbup-app\cookies.json" `
+  --tid 171
 ```
 
-脚本按以下流程执行：
+也可以把固定配置放到环境变量：
+
+```powershell
+$env:BILIUP_EXE="E:\Programs\bbup-app\binaries\biliup.exe"
+$env:BILIUP_COOKIES="E:\Programs\bbup-app\cookies.json"
+$env:BILI_TID="171"
+
+python .\scripts\bilibili_roundtrip.py .\runs\fov_1080_s500.mp4
+```
+
+## 自动流程
 
 ```text
 source.mp4
-  -> Open API 上传预处理
-  -> 视频上传（<=100 MiB 单文件；更大则 8 MiB 分片）
-  -> 自动从首帧生成封面并上传
-  -> 提交稿件
-  -> 轮询 /arcopen/fn/archive/view
-  -> state=0 / 开放浏览
-  -> yt-dlp 下载公开播放版本（默认优先 H.264、<=720p）
-  -> ffprobe 记录平台视频信息
-  -> video2file.py 解码
-  -> RaptorQ + SHA256 验证
+  -> biliup upload
+  -> 从上传日志直接解析 aid / BVID
+     -> 若日志格式变化，退化为唯一标题 + biliup list 反查 BVID
+  -> 每 30 秒轮询：
+       biliup list --pubed
+       biliup list --not-pubed
+  -> BVID 出现在 --pubed：审核/发布完成
+  -> BVID 出现在 --not-pubed：立即失败
+  -> biliup show <BVID> 保存稿件详情
+  -> yt-dlp 下载公开播放 rendition
+  -> ffprobe 记录平台编码信息
+  -> video2file.py
+  -> QR / CRC32 / RaptorQ / SHA256
 ```
 
-运行目录示例：
+上传默认使用与手工验证一致的参数：
 
 ```text
-runs/bilibili-YYYYMMDD-HHMMSS/
-  cover.jpg
-  platform.mp4
-  download_attempt_1.log
-  decode.log
-  result.json
-  recovered/
+--submit app
+--copyright 1
+--limit 3
+--tag "FOV,二维码,测试"
+--desc "FOV 视频信道自动化实验"
 ```
 
-`result.json` 会保存 BV/resource id、审核状态历史、公开 URL、下载后 `ffprobe` 信息和最终解码结果，不保存 `client_id`、`app_secret` 或 `access_token`。
+不传 `--title` 时，脚本生成包含时间戳和源视频文件名的唯一标题，并限制在 80 字符内。
 
-## 下载格式
+可覆盖：
 
-默认下载选择器：
+```powershell
+python .\scripts\bilibili_roundtrip.py .\runs\source.mp4 `
+  --biliup "E:\Programs\bbup-app\binaries\biliup.exe" `
+  --biliup-cookies "E:\Programs\bbup-app\cookies.json" `
+  --tid 171 `
+  --title "FOV 自动回环测试 500B" `
+  --tag "FOV,二维码,测试" `
+  --desc "FOV 视频信道自动化实验" `
+  --submit app
+```
+
+## BVID 获取
+
+当前 `biliup 1.2.x` 投稿成功日志会出现类似：
+
+```text
+ResponseData { code: 0, data: Some(Object {
+  "aid": Number(117059015018441),
+  "bvid": String("BV1wFug64EZg")
+}), message: "OK" }
+APP接口投稿成功
+```
+
+脚本优先直接解析该 `bvid`。如果未来日志格式变化导致解析失败，则使用本次唯一标题依次查询：
+
+```text
+biliup list --is-pubing
+biliup list --pubed
+biliup list --not-pubed
+```
+
+以标题反查 BVID。
+
+## 审核等待
+
+默认：
+
+```text
+poll interval     = 30 s
+approval timeout  = 7200 s
+status max pages  = 3
+```
+
+可调整：
+
+```powershell
+--poll-interval 30
+--approval-timeout 7200
+--status-max-pages 3
+```
+
+判断只依赖 BVID 是否出现在对应列表中，不依赖 `biliup list` 第三列文本，因为处理中稿件的第三列可能显示简介而不是状态。
+
+所有状态查询原始输出追加保存到：
+
+```text
+review.log
+```
+
+同时 `result.json` 中保存结构化 `review_history`。
+
+## 下载登录态
+
+默认下载格式：
 
 ```text
 bestvideo[height<=720][vcodec^=avc1]/bestvideo[height<=720]/best[height<=720]/best
 ```
 
-这是为了优先拿到当前实验最关心的 720p H.264 平台 rendition。可以覆盖：
+即优先拿实验当前关注的 `<=720p H.264` 平台 rendition。
+
+如果没有显式指定下载 Cookie，脚本会把 `biliup cookies.json` 中的 `cookie_info.cookies` 临时转换成 Netscape cookie 文件交给 `yt-dlp`，下载结束后立即删除临时文件。因此通常只需要登录一次 biliup。
+
+如需覆盖：
 
 ```powershell
-python .\scripts\bilibili_roundtrip.py .\runs\source.mp4 `
-  --tid 123 `
-  --download-format "bestvideo[height=720]/bestvideo" `
-  --cookies-from-browser chrome
+# 直接使用浏览器登录态
+--cookies-from-browser edge
+
+# 或显式 Netscape cookies.txt
+--yt-dlp-cookies .\cookies.txt
+
+# 或强制匿名下载
+--anonymous-download
 ```
 
-`yt-dlp` 对 Bilibili 可能遇到 403/412、登录或高画质权限限制。脚本默认重试 5 次；如果匿名下载失败，可通过 `--cookies-from-browser chrome|edge|firefox` 或 `--cookies cookies.txt` 使用你自己的浏览器登录态。Open Platform 的 `access_token` 与播放页 Cookie 是两套不同的认证体系。
+`yt-dlp` 默认重试 5 次，审核刚通过但目标 rendition 尚未就绪时也会等待重试。
 
-## 审核等待
+## 输出
 
-默认每 30 秒查询一次，最长等待 2 小时：
+每次运行生成：
+
+```text
+runs/bilibili-YYYYMMDD-HHMMSS/
+  upload.log
+  review.log
+  show.log
+  download_attempt_1.log
+  platform.mp4
+  decode.log
+  result.json
+  recovered/
+```
+
+`result.json` 包含：
+
+```text
+source video / bytes
+标题 / tid / submit
+上传耗时 / 返回码
+aid / bvid / share_url
+review_history
+published_at
+download_auth
+平台视频大小
+ffprobe 信息
+QR decoded / failed
+failed frame indices
+每个 block 的 K / N / received source / received repair / decoded_at_frame
+CRC failed
+Original / Recovered SHA256
+最终 decode_ok
+```
+
+账号 Cookie 内容不会写进 `result.json`。
+
+## 测试
 
 ```powershell
---poll-interval 30
---approval-timeout 7200
+python -m compileall fov.py file2video.py video2file.py scripts tests
+python -m pytest -q
 ```
 
-当接口返回 `state=0` / `开放浏览` 时开始下载；如果返回明确的退回/失败/删除/锁定状态或 `reject_reason`，脚本立即失败并把最后状态写入 `result.json`。其它未识别的处理中状态继续等待，避免把正常审核中的负状态码误判为失败。
-
-开放平台还提供 `video_open` / `video_fail` WebHook；对于本地一次性实验，轮询无需公网回调地址，因此实现更简单。若以后把回环测试部署为长期服务，可以再改成 WebHook 驱动。
-
-## 可选清理
-
-成功解码后自动删除本次 Bilibili 稿件：
-
-```powershell
---delete-after
-```
-
-默认**不会**删除，避免脚本在实验数据尚未确认时自动修改账号内容。
-
-## Open API 文件限制
-
-开放平台文档当前给出的主要视频约束包括：文件最大 4 GB、时长小于 5 小时、推荐 MP4/FLV、峰值码率最大 60 Mbps、分辨率最大 4096×4096、帧率最大 120 fps、YUV420；超过 100 MiB 需走分片上传。脚本会自动在单文件和 8 MiB 分片流程之间选择。
+单元测试不调用真实 B 站，覆盖 `biliup 1.2.x` 投稿日志解析、稿件列表解析、上传命令构造、biliup Cookie 到临时 Netscape Cookie 的转换，以及真实 decoder 诊断日志解析。
