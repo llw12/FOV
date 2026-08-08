@@ -5,7 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.scan_params import ScanCase, build_cases, parse_case, parse_decoder_output, simulation_bitrate_kbps
+from scripts.scan_params import (
+    DEFAULT_STRESS_BITRATES_KBPS,
+    ScanCase,
+    build_cases,
+    parse_case,
+    parse_decoder_output,
+)
 
 
 def test_parse_case_defaults_and_explicit_values() -> None:
@@ -18,11 +24,22 @@ def test_parse_case_rejects_invalid_text() -> None:
         parse_case("1080p:500")
 
 
-def test_parse_decoder_output() -> None:
+def test_parse_decoder_output_with_diagnostics() -> None:
     text = """
+Block 0:
+  K: 800
+  N: 960
+  received unique: 800
+  received source: 786
+  received repair: 14
+  decoded at frame: 837
+  [OK]
+
 QR:
   decoded: 964
   failed: 19
+  failed frame indices (0-based): 91,126,220,337
+  failed frame indices truncated: no
 
 Packets:
   valid META: 23
@@ -35,7 +52,24 @@ Packets:
         "qr_failed": 19,
         "crc_failed": 0,
         "post_decode_symbols": 141,
+        "failed_frame_indices": [91, 126, 220, 337],
+        "failed_frame_indices_truncated": False,
+        "decoded_at_frames": [837],
     }
+
+
+def test_parse_decoder_output_handles_truncated_or_empty_indices() -> None:
+    text = """
+QR:
+  decoded: 10
+  failed: 900
+  failed frame indices (0-based): -
+  failed frame indices truncated: yes
+"""
+    parsed = parse_decoder_output(text)
+    assert parsed["failed_frame_indices"] == []
+    assert parsed["failed_frame_indices_truncated"] is True
+    assert parsed["decoded_at_frames"] == []
 
 
 def test_targeted_matrix_and_repair_expansion() -> None:
@@ -52,6 +86,5 @@ def test_custom_cases_override_preset() -> None:
     assert build_cases(args) == [custom[0]]
 
 
-def test_simulation_bitrate_uses_resolution_band() -> None:
-    assert simulation_bitrate_kbps(ScanCase(1280, 720, 280, 0.2), 900, 1500) == 900
-    assert simulation_bitrate_kbps(ScanCase(1920, 1080, 500, 0.2), 900, 1500) == 1500
+def test_default_stress_bitrate_ladder() -> None:
+    assert DEFAULT_STRESS_BITRATES_KBPS == [2100, 1400, 1000, 700]
