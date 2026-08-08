@@ -1,0 +1,6 @@
+pyraptorq==0.1.7
+qrcode[pil]
+opencv-python
+zxing-cpp
+numpy
+pytest
