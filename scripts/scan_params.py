@@ -1,9 +1,8 @@
-"""Automate FOV parameter scans with local and platform-like FFmpeg validation.
+"""Automate FOV parameter scans with local and repeatable FFmpeg stress validation.
 
-This script intentionally treats the FFmpeg transcode as a reproducible approximation
-of a video-platform transcode, not an exact model of any platform's private pipeline.
-The generated source MP4 files are kept so the best candidates can be uploaded for
-manual platform validation afterwards.
+The FFmpeg stress transcodes are intentionally empirical screening profiles, not an
+exact model of any platform's private pipeline. Source MP4 files are retained so the
+best candidates can be uploaded for manual platform validation afterwards.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,8 +24,6 @@ from typing import Any, Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = REPO_ROOT / "test.zip"
 
-# Targeted defaults follow the currently useful search region. The 720p cases map
-# the known box_size=8 range; the 1080p cases probe the larger QR payload range.
 TARGETED_BASE_CASES = [
     (1280, 720, 200),
     (1280, 720, 240),
@@ -39,12 +36,13 @@ TARGETED_BASE_CASES = [
 FULL_SYMBOL_SIZES = [200, 240, 280, 400, 500, 600, 700]
 FULL_RESOLUTIONS = [(1280, 720), (1920, 1080)]
 
-# Approximate H.264 stress profiles. 720p ~= 900 kbps is based on an observed
-# platform rendition from the current FOV experiments. 1080p=1500 kbps is a
-# deliberately conservative approximation until more measured platform samples
-# are collected. Both are CLI-overridable.
-DEFAULT_SIM_BITRATE_720_KBPS = 900
-DEFAULT_SIM_BITRATE_1080_KBPS = 1500
+# The real 1080p->platform sample observed in this project was delivered as 720p,
+# while simple 720p/2.1 Mbps FFmpeg transcodes were still milder than the platform.
+# Scan a bitrate ladder instead of pretending one bitrate is an exact platform model.
+DEFAULT_STRESS_BITRATES_KBPS = [2100, 1400, 1000, 700]
+DEFAULT_STRESS_WIDTH = 1280
+DEFAULT_STRESS_HEIGHT = 720
+DEFAULT_STRESS_SCALE = "bicubic"
 
 
 @dataclass(frozen=True)
@@ -59,6 +57,30 @@ class ScanCase:
     def case_id(self) -> str:
         repair_pct = round(self.repair * 100)
         return f"{self.width}x{self.height}_s{self.symbol_size}_r{repair_pct:02d}"
+
+
+@dataclass
+class StressResult:
+    target_bitrate_kbps: int
+    target_width: int
+    target_height: int
+    scale_flags: str
+    video: str = ""
+    video_bytes: int | None = None
+    bitrate_bps: int | None = None
+    ok: bool = False
+    qr_decoded: int | None = None
+    qr_failed: int | None = None
+    crc_failed: int | None = None
+    post_decode_symbols: int | None = None
+    failed_frame_indices: list[int] = field(default_factory=list)
+    failed_frame_indices_truncated: bool = False
+    decoded_at_frames: list[int] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def profile_id(self) -> str:
+        return f"{self.target_width}x{self.target_height}_{self.scale_flags}_{self.target_bitrate_kbps}k"
 
 
 @dataclass
@@ -84,18 +106,11 @@ class CaseResult:
     local_qr_failed: int | None = None
     local_crc_failed: int | None = None
     local_post_decode_symbols: int | None = None
+    local_failed_frame_indices: list[int] = field(default_factory=list)
+    local_failed_frame_indices_truncated: bool = False
+    local_decoded_at_frames: list[int] = field(default_factory=list)
     local_error: str = ""
-    sim_profile: str = ""
-    sim_target_bitrate_kbps: int | None = None
-    sim_video: str = ""
-    sim_video_bytes: int | None = None
-    sim_bitrate_bps: int | None = None
-    sim_ok: bool = False
-    sim_qr_decoded: int | None = None
-    sim_qr_failed: int | None = None
-    sim_crc_failed: int | None = None
-    sim_post_decode_symbols: int | None = None
-    sim_error: str = ""
+    stress_results: list[StressResult] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -131,12 +146,31 @@ def metric(text: str, label: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def parse_decoder_output(text: str) -> dict[str, int | None]:
+def text_metric(text: str, label: str) -> str | None:
+    match = re.search(rf"^\s*{re.escape(label)}:\s*(.*?)\s*$", text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def parse_int_list(value: str | None) -> list[int]:
+    if value is None or value.strip() in {"", "-"}:
+        return []
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def parse_decoder_output(text: str) -> dict[str, Any]:
+    failed_indices = parse_int_list(text_metric(text, "failed frame indices (0-based)"))
+    truncated = text_metric(text, "failed frame indices truncated")
+    decoded_at_frames = [
+        int(value) for value in re.findall(r"^\s*decoded at frame:\s*(\d+)\s*$", text, re.MULTILINE)
+    ]
     return {
         "qr_decoded": metric(text, "decoded"),
         "qr_failed": metric(text, "failed"),
         "crc_failed": metric(text, "CRC failed"),
         "post_decode_symbols": metric(text, "post-decode symbols"),
+        "failed_frame_indices": failed_indices,
+        "failed_frame_indices_truncated": truncated == "yes",
+        "decoded_at_frames": decoded_at_frames,
     }
 
 
@@ -225,7 +259,7 @@ def validate_video(
     log_path: Path,
     *,
     verbose: bool,
-) -> tuple[bool, dict[str, int | None], str]:
+) -> tuple[bool, dict[str, Any], str]:
     shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     result = run_logged([sys.executable, "video2file.py", str(video_path), str(output_dir)], log_path, verbose=verbose)
@@ -237,17 +271,14 @@ def validate_video(
     return True, stats, ""
 
 
-def simulation_bitrate_kbps(case: ScanCase, bitrate_720: int, bitrate_1080: int) -> int:
-    if case.height <= 720:
-        return bitrate_720
-    return bitrate_1080
-
-
-def transcode_platform_like(
+def transcode_stress(
     source: Path,
     target: Path,
     case: ScanCase,
     bitrate_kbps: int,
+    target_width: int,
+    target_height: int,
+    scale_flags: str,
     log_path: Path,
     *,
     verbose: bool,
@@ -255,7 +286,7 @@ def transcode_platform_like(
     target.parent.mkdir(parents=True, exist_ok=True)
     command = [
         "ffmpeg", "-y", "-i", str(source), "-an",
-        "-vf", f"scale={case.width}:{case.height}:flags=lanczos",
+        "-vf", f"scale={target_width}:{target_height}:flags={scale_flags}",
         "-r", str(case.fps), "-fps_mode", "cfr",
         "-c:v", "libx264", "-profile:v", "high", "-preset", "medium",
         "-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k",
@@ -268,7 +299,6 @@ def transcode_platform_like(
 
 def build_cases(args: argparse.Namespace) -> list[ScanCase]:
     if args.case:
-        # Preserve order but remove exact duplicates.
         return list(dict.fromkeys(args.case))
 
     repairs = args.repairs
@@ -280,73 +310,162 @@ def build_cases(args: argparse.Namespace) -> list[ScanCase]:
     return [ScanCase(width, height, symbol, repair, args.fps) for width, height, symbol in bases for repair in repairs]
 
 
+def _relative(path: Path) -> str:
+    return str(path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path)
+
+
+def _stress_pass_floor(item: CaseResult) -> int | None:
+    passed = [stress.target_bitrate_kbps for stress in item.stress_results if stress.ok]
+    return min(passed) if passed else None
+
+
+def _stress_failure_cell(stress: StressResult | None) -> str:
+    if stress is None:
+        return "-"
+    status = "PASS" if stress.ok else "FAIL"
+    if stress.qr_failed is None or stress.qr_decoded is None:
+        return status
+    total = stress.qr_failed + stress.qr_decoded
+    return f"{status} {stress.qr_failed}/{total}" if total else status
+
+
 def save_results(results: list[CaseResult], run_dir: Path) -> None:
-    rows = [asdict(item) for item in results]
-    json_path = run_dir / "results.json"
+    json_payload = [asdict(item) for item in results]
+    (run_dir / "results.json").write_text(
+        json.dumps(json_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    flat_rows: list[dict[str, Any]] = []
+    for item in results:
+        base = {
+            "case_id": item.case_id,
+            "width": item.width,
+            "height": item.height,
+            "fps": item.fps,
+            "symbol_size": item.symbol_size,
+            "repair": item.repair,
+            "input_bytes": item.input_bytes,
+            "encode_ok": item.encode_ok,
+            "encode_seconds": item.encode_seconds,
+            "source_video": item.source_video,
+            "source_video_bytes": item.source_video_bytes,
+            "source_frames": item.source_frames,
+            "source_duration_s": item.source_duration_s,
+            "source_bitrate_bps": item.source_bitrate_bps,
+            "effective_file_Bps": item.effective_file_Bps,
+            "local_ok": item.local_ok,
+            "local_qr_decoded": item.local_qr_decoded,
+            "local_qr_failed": item.local_qr_failed,
+            "local_crc_failed": item.local_crc_failed,
+            "local_decoded_at_frames": ",".join(map(str, item.local_decoded_at_frames)),
+            "local_error": item.local_error,
+        }
+        if not item.stress_results:
+            flat_rows.append(base)
+        for stress in item.stress_results:
+            row = dict(base)
+            row.update({
+                "stress_profile": stress.profile_id,
+                "stress_target_bitrate_kbps": stress.target_bitrate_kbps,
+                "stress_target_width": stress.target_width,
+                "stress_target_height": stress.target_height,
+                "stress_scale_flags": stress.scale_flags,
+                "stress_video": stress.video,
+                "stress_video_bytes": stress.video_bytes,
+                "stress_bitrate_bps": stress.bitrate_bps,
+                "stress_ok": stress.ok,
+                "stress_qr_decoded": stress.qr_decoded,
+                "stress_qr_failed": stress.qr_failed,
+                "stress_crc_failed": stress.crc_failed,
+                "stress_post_decode_symbols": stress.post_decode_symbols,
+                "stress_failed_frame_indices": ",".join(map(str, stress.failed_frame_indices)),
+                "stress_failed_frame_indices_truncated": stress.failed_frame_indices_truncated,
+                "stress_decoded_at_frames": ",".join(map(str, stress.decoded_at_frames)),
+                "stress_error": stress.error,
+            })
+            flat_rows.append(row)
+
     csv_path = run_dir / "results.csv"
-    json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    if rows:
+    if flat_rows:
+        fieldnames: list[str] = []
+        for row in flat_rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
         with csv_path.open("w", newline="", encoding="utf-8-sig") as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(flat_rows)
+
     write_summary(results, run_dir / "summary.md")
     write_manual_queue(results, run_dir / "manual_queue.csv")
 
 
-def status(value: bool) -> str:
-    return "PASS" if value else "FAIL"
-
-
 def write_summary(results: list[CaseResult], path: Path) -> None:
-    lines = [
-        "# FOV parameter scan\n",
-        "> FFmpeg simulation is a reproducible platform-like approximation, not an exact model of Bilibili's private encoder.\n",
-        "| case | encode | local | simulated | QR fail(sim) | source bitrate | throughput | source video |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | --- |",
-    ]
-    for item in results:
-        qr_fail = "-"
-        if item.sim_qr_failed is not None and item.sim_qr_decoded is not None:
-            total = item.sim_qr_failed + item.sim_qr_decoded
-            qr_fail = f"{item.sim_qr_failed}/{total} ({item.sim_qr_failed / total:.2%})" if total else "-"
-        bitrate = f"{item.source_bitrate_bps / 1000:.0f} kbps" if item.source_bitrate_bps else "-"
-        throughput = f"{item.effective_file_Bps / 1000:.2f} KB/s" if item.effective_file_Bps else "-"
-        lines.append(
-            f"| {item.case_id} | {status(item.encode_ok)} | {status(item.local_ok)} | {status(item.sim_ok)} | "
-            f"{qr_fail} | {bitrate} | {throughput} | `{item.source_video}` |"
-        )
-    passed = sorted(
-        (item for item in results if item.local_ok and item.sim_ok),
-        key=lambda item: item.effective_file_Bps or 0,
+    bitrates = sorted(
+        {stress.target_bitrate_kbps for item in results for stress in item.stress_results},
         reverse=True,
     )
+    header = ["case", "local", "throughput"] + [f"{bitrate}k" for bitrate in bitrates] + ["source video"]
+    lines = [
+        "# FOV parameter × stress bitrate scan",
+        "",
+        "> Stress profiles are reproducible screening transcodes, not an exact model of Bilibili's private encoder.",
+        "",
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * len(header)) + " |",
+    ]
+    for item in results:
+        throughput = f"{item.effective_file_Bps / 1000:.2f} KB/s" if item.effective_file_Bps else "-"
+        by_bitrate = {stress.target_bitrate_kbps: stress for stress in item.stress_results}
+        cells = [
+            item.case_id,
+            "PASS" if item.local_ok else "FAIL",
+            throughput,
+            *[_stress_failure_cell(by_bitrate.get(bitrate)) for bitrate in bitrates],
+            f"`{item.source_video}`" if item.source_video else "-",
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+
+    candidates = sorted(
+        (item for item in results if item.local_ok and any(stress.ok for stress in item.stress_results)),
+        key=lambda item: (-(item.effective_file_Bps or 0), _stress_pass_floor(item) or 10**9),
+    )
     lines.extend(["", "## Manual validation candidates", ""])
-    if not passed:
-        lines.append("No case passed both local and simulated validation.")
+    if not candidates:
+        lines.append("No case passed local validation plus any stress profile.")
     else:
-        lines.append("Upload the original source MP4, not the simulated MP4. Highest-throughput candidates are listed first.\n")
-        for index, item in enumerate(passed, 1):
-            lines.append(f"{index}. `{item.case_id}` — `{item.source_video}`")
+        lines.append(
+            "Upload the original source MP4, not a stress MP4. "
+            "`pass floor` is the lowest tested bitrate that still recovered the file."
+        )
+        lines.append("")
+        for index, item in enumerate(candidates, 1):
+            lines.append(
+                f"{index}. `{item.case_id}` — pass floor `{_stress_pass_floor(item)}k` — `{item.source_video}`"
+            )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_manual_queue(results: list[CaseResult], path: Path) -> None:
     candidates = sorted(
-        (item for item in results if item.local_ok and item.sim_ok),
-        key=lambda item: item.effective_file_Bps or 0,
-        reverse=True,
+        (item for item in results if item.local_ok and any(stress.ok for stress in item.stress_results)),
+        key=lambda item: (-(item.effective_file_Bps or 0), _stress_pass_floor(item) or 10**9),
     )
     fields = [
         "case_id", "width", "height", "symbol_size", "repair", "source_video",
-        "effective_file_Bps", "sim_qr_failed", "sim_qr_decoded",
+        "effective_file_Bps", "stress_pass_floor_kbps", "stress_pass_bitrates_kbps",
         "platform_video_path", "platform_qr_decoded", "platform_qr_failed",
-        "platform_crc_failed", "platform_sha256_match", "notes",
+        "platform_crc_failed", "platform_sha256_match", "platform_failed_frame_indices", "notes",
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for item in candidates:
+            pass_bitrates = sorted(
+                (stress.target_bitrate_kbps for stress in item.stress_results if stress.ok),
+                reverse=True,
+            )
             writer.writerow({
                 "case_id": item.case_id,
                 "width": item.width,
@@ -355,13 +474,14 @@ def write_manual_queue(results: list[CaseResult], path: Path) -> None:
                 "repair": item.repair,
                 "source_video": item.source_video,
                 "effective_file_Bps": item.effective_file_Bps,
-                "sim_qr_failed": item.sim_qr_failed,
-                "sim_qr_decoded": item.sim_qr_decoded,
+                "stress_pass_floor_kbps": min(pass_bitrates) if pass_bitrates else "",
+                "stress_pass_bitrates_kbps": ",".join(map(str, pass_bitrates)),
                 "platform_video_path": "",
                 "platform_qr_decoded": "",
                 "platform_qr_failed": "",
                 "platform_crc_failed": "",
                 "platform_sha256_match": "",
+                "platform_failed_frame_indices": "",
                 "notes": "",
             })
 
@@ -378,10 +498,12 @@ def run_case(
     expected_sha256: str,
     run_dir: Path,
     *,
-    bitrate_720: int,
-    bitrate_1080: int,
+    stress_bitrates: list[int],
+    stress_width: int,
+    stress_height: int,
+    stress_scale: str,
     verbose: bool,
-    keep_sim_video: bool,
+    keep_stress_videos: bool,
 ) -> CaseResult:
     case_dir = run_dir / "cases" / case.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -394,11 +516,11 @@ def run_case(
         symbol_size=case.symbol_size,
         repair=case.repair,
         input_bytes=input_path.stat().st_size,
-        source_video=str(source_video.relative_to(REPO_ROOT) if source_video.is_relative_to(REPO_ROOT) else source_video),
+        source_video=_relative(source_video),
     )
 
     print(f"\n=== {case.case_id} ===")
-    print("[1/3] encode")
+    print("[1/2] encode")
     encode_command = [
         sys.executable, "file2video.py", str(input_path), str(source_video),
         "--symbol-size", str(case.symbol_size), "--repair", str(case.repair),
@@ -411,6 +533,7 @@ def run_case(
         print(f"  FAIL: {result.encode_error}")
         return result
     result.encode_ok = True
+
     try:
         probe = ffprobe_video(source_video)
         result.source_video_bytes = probe["size_bytes"]
@@ -419,10 +542,10 @@ def run_case(
         result.source_bitrate_bps = probe["bitrate_bps"]
         if result.source_duration_s:
             result.effective_file_Bps = result.input_bytes / result.source_duration_s
-    except Exception as exc:  # ffprobe metadata is useful but not required for decode validation.
+    except Exception as exc:
         result.encode_error = f"ffprobe warning: {exc}"
 
-    print("[2/3] local decode")
+    print("[2/2] local decode")
     local_ok, local_stats, local_error = validate_video(
         source_video, case_dir / "local_recovered", expected_sha256, case_dir / "local_decode.log", verbose=verbose
     )
@@ -431,61 +554,98 @@ def run_case(
     result.local_qr_failed = local_stats["qr_failed"]
     result.local_crc_failed = local_stats["crc_failed"]
     result.local_post_decode_symbols = local_stats["post_decode_symbols"]
+    result.local_failed_frame_indices = local_stats["failed_frame_indices"]
+    result.local_failed_frame_indices_truncated = local_stats["failed_frame_indices_truncated"]
+    result.local_decoded_at_frames = local_stats["decoded_at_frames"]
     result.local_error = local_error
     if not local_ok:
         print(f"  FAIL: {local_error}")
         return result
 
-    bitrate_kbps = simulation_bitrate_kbps(case, bitrate_720, bitrate_1080)
-    result.sim_profile = f"platform_like_h264_{bitrate_kbps}k"
-    result.sim_target_bitrate_kbps = bitrate_kbps
-    sim_video = case_dir / "sim_platform.mp4"
-    result.sim_video = str(sim_video.relative_to(REPO_ROOT) if sim_video.is_relative_to(REPO_ROOT) else sim_video)
-    print(f"[3/3] simulated platform transcode @ {bitrate_kbps} kbps")
-    transcoded = transcode_platform_like(
-        source_video, sim_video, case, bitrate_kbps, case_dir / "sim_ffmpeg.log", verbose=verbose
-    )
-    if transcoded.returncode != 0 or not sim_video.exists():
-        result.sim_error = error_tail(transcoded.output)
-        print(f"  FAIL: {result.sim_error}")
-        return result
-    try:
-        sim_probe = ffprobe_video(sim_video)
-        result.sim_video_bytes = sim_probe["size_bytes"]
-        result.sim_bitrate_bps = sim_probe["bitrate_bps"]
-    except Exception as exc:
-        result.sim_error = f"ffprobe warning: {exc}"
+    for stress_index, bitrate_kbps in enumerate(stress_bitrates, 1):
+        stress = StressResult(
+            target_bitrate_kbps=bitrate_kbps,
+            target_width=stress_width,
+            target_height=stress_height,
+            scale_flags=stress_scale,
+        )
+        stress_dir = case_dir / "stress" / stress.profile_id
+        sim_video = stress_dir / "video.mp4"
+        stress.video = _relative(sim_video)
+        print(
+            f"[stress {stress_index}/{len(stress_bitrates)}] "
+            f"{stress_width}x{stress_height} {stress_scale} @ {bitrate_kbps} kbps"
+        )
+        transcoded = transcode_stress(
+            source_video, sim_video, case, bitrate_kbps, stress_width, stress_height, stress_scale,
+            stress_dir / "ffmpeg.log", verbose=verbose,
+        )
+        if transcoded.returncode != 0 or not sim_video.exists():
+            stress.error = error_tail(transcoded.output)
+            result.stress_results.append(stress)
+            print(f"  FAIL: {stress.error}")
+            continue
 
-    sim_ok, sim_stats, sim_error = validate_video(
-        sim_video, case_dir / "sim_recovered", expected_sha256, case_dir / "sim_decode.log", verbose=verbose
-    )
-    result.sim_ok = sim_ok
-    result.sim_qr_decoded = sim_stats["qr_decoded"]
-    result.sim_qr_failed = sim_stats["qr_failed"]
-    result.sim_crc_failed = sim_stats["crc_failed"]
-    result.sim_post_decode_symbols = sim_stats["post_decode_symbols"]
-    if sim_error:
-        result.sim_error = sim_error if not result.sim_error else result.sim_error + " | " + sim_error
-    print("  PASS" if sim_ok else f"  FAIL: {result.sim_error}")
+        try:
+            sim_probe = ffprobe_video(sim_video)
+            stress.video_bytes = sim_probe["size_bytes"]
+            stress.bitrate_bps = sim_probe["bitrate_bps"]
+        except Exception as exc:
+            stress.error = f"ffprobe warning: {exc}"
 
-    if not keep_sim_video:
-        sim_video.unlink(missing_ok=True)
-        result.sim_video += " (deleted after validation)"
+        sim_ok, sim_stats, sim_error = validate_video(
+            sim_video, stress_dir / "recovered", expected_sha256, stress_dir / "decode.log", verbose=verbose
+        )
+        stress.ok = sim_ok
+        stress.qr_decoded = sim_stats["qr_decoded"]
+        stress.qr_failed = sim_stats["qr_failed"]
+        stress.crc_failed = sim_stats["crc_failed"]
+        stress.post_decode_symbols = sim_stats["post_decode_symbols"]
+        stress.failed_frame_indices = sim_stats["failed_frame_indices"]
+        stress.failed_frame_indices_truncated = sim_stats["failed_frame_indices_truncated"]
+        stress.decoded_at_frames = sim_stats["decoded_at_frames"]
+        if sim_error:
+            stress.error = sim_error if not stress.error else stress.error + " | " + sim_error
+        result.stress_results.append(stress)
+        print("  PASS" if stress.ok else f"  FAIL: {stress.error}")
+
+        if not keep_stress_videos:
+            sim_video.unlink(missing_ok=True)
+            stress.video += " (deleted after validation)"
+
     return result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scan FOV video parameters and validate local/platform-like roundtrips")
+    parser = argparse.ArgumentParser(
+        description="Scan FOV symbol parameters against a repeatable FFmpeg stress bitrate ladder"
+    )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "runs")
     parser.add_argument("--preset", choices=("targeted", "full"), default="targeted")
     parser.add_argument("--repairs", type=float, nargs="+", default=[0.20], help="repair ratios used with preset cases")
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--case", type=parse_case, action="append", help="custom WIDTHxHEIGHT:SYMBOL[:REPAIR[:FPS]]; repeatable")
-    parser.add_argument("--sim-bitrate-720", type=int, default=DEFAULT_SIM_BITRATE_720_KBPS)
-    parser.add_argument("--sim-bitrate-1080", type=int, default=DEFAULT_SIM_BITRATE_1080_KBPS)
-    parser.add_argument("--keep-sim-videos", action="store_true", help="keep simulated transcodes; source videos are always kept")
-    parser.add_argument("--verbose", action="store_true", help="echo child process output while also saving logs")
+    parser.add_argument(
+        "--case", type=parse_case, action="append",
+        help="custom WIDTHxHEIGHT:SYMBOL[:REPAIR[:FPS]]; repeatable",
+    )
+    parser.add_argument(
+        "--stress-bitrates", type=int, nargs="+", default=DEFAULT_STRESS_BITRATES_KBPS,
+        help="bitrate ladder in kbps; each case is encoded once then tested at every bitrate",
+    )
+    parser.add_argument("--stress-width", type=int, default=DEFAULT_STRESS_WIDTH)
+    parser.add_argument("--stress-height", type=int, default=DEFAULT_STRESS_HEIGHT)
+    parser.add_argument(
+        "--stress-scale",
+        choices=("fast_bilinear", "bilinear", "bicubic", "lanczos"),
+        default=DEFAULT_STRESS_SCALE,
+    )
+    parser.add_argument(
+        "--keep-stress-videos", "--keep-sim-videos",
+        dest="keep_stress_videos", action="store_true",
+        help="keep stress transcodes; source videos are always kept",
+    )
+    parser.add_argument("--verbose", action="store_true", help="echo child output while also saving logs")
     args = parser.parse_args()
 
     ensure_tools()
@@ -497,8 +657,13 @@ def main() -> None:
     for repair in args.repairs:
         if not 0 <= repair <= 5:
             raise SystemExit(f"invalid repair ratio: {repair}")
+    if min(args.fps, args.stress_width, args.stress_height) <= 0:
+        raise SystemExit("fps and stress dimensions must be positive")
+    if not args.stress_bitrates or any(bitrate <= 0 for bitrate in args.stress_bitrates):
+        raise SystemExit("stress bitrates must be positive")
 
     cases = build_cases(args)
+    stress_bitrates = list(dict.fromkeys(args.stress_bitrates))
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = args.output_root.resolve() / f"scan-{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -511,16 +676,27 @@ def main() -> None:
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "preset": args.preset,
         "cases": [asdict(case) for case in cases],
-        "simulation": {
-            "description": "reproducible Bilibili-like H.264 approximation, not an exact platform model",
-            "bitrate_720_kbps": args.sim_bitrate_720,
-            "bitrate_1080_kbps": args.sim_bitrate_1080,
+        "stress": {
+            "description": "repeatable screening ladder, not an exact platform model",
+            "target_width": args.stress_width,
+            "target_height": args.stress_height,
+            "scale_flags": args.stress_scale,
+            "bitrates_kbps": stress_bitrates,
             "codec": "libx264 High / yuv420p / CFR / GOP 250 / 3 B-frames",
         },
     }
     (run_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"FOV parameter scan\nInput: {input_path}\nSHA256: {expected_sha256}\nCases: {len(cases)}\nRun: {run_dir}")
+    print(
+        f"FOV parameter × stress scan\n"
+        f"Input: {input_path}\n"
+        f"SHA256: {expected_sha256}\n"
+        f"Cases: {len(cases)}\n"
+        f"Stress bitrates: {stress_bitrates} kbps\n"
+        f"Stress output: {args.stress_width}x{args.stress_height} ({args.stress_scale})\n"
+        f"Run: {run_dir}"
+    )
+
     results: list[CaseResult] = []
     try:
         for index, case in enumerate(cases, 1):
@@ -528,29 +704,41 @@ def main() -> None:
             try:
                 item = run_case(
                     case, input_path, expected_sha256, run_dir,
-                    bitrate_720=args.sim_bitrate_720,
-                    bitrate_1080=args.sim_bitrate_1080,
+                    stress_bitrates=stress_bitrates,
+                    stress_width=args.stress_width,
+                    stress_height=args.stress_height,
+                    stress_scale=args.stress_scale,
                     verbose=args.verbose,
-                    keep_sim_video=args.keep_sim_videos,
+                    keep_stress_videos=args.keep_stress_videos,
                 )
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 item = CaseResult(
-                    case_id=case.case_id, width=case.width, height=case.height, fps=case.fps,
-                    symbol_size=case.symbol_size, repair=case.repair, input_bytes=input_path.stat().st_size,
+                    case_id=case.case_id,
+                    width=case.width,
+                    height=case.height,
+                    fps=case.fps,
+                    symbol_size=case.symbol_size,
+                    repair=case.repair,
+                    input_bytes=input_path.stat().st_size,
                     encode_error=f"unexpected scan error: {type(exc).__name__}: {exc}",
                 )
                 print(f"  ERROR: {item.encode_error}")
             results.append(item)
-            save_results(results, run_dir)  # Persist after every case so long scans are crash-tolerant.
+            save_results(results, run_dir)
     except KeyboardInterrupt:
         print("\nInterrupted; partial results have been preserved.")
         save_results(results, run_dir)
         raise SystemExit(130)
 
-    passed = sum(item.local_ok and item.sim_ok for item in results)
-    print(f"\nDone: {passed}/{len(results)} cases passed local + simulated validation")
+    local_passed = sum(item.local_ok for item in results)
+    stress_passed = sum(stress.ok for item in results for stress in item.stress_results)
+    stress_total = sum(len(item.stress_results) for item in results)
+    print(
+        f"\nDone: {local_passed}/{len(results)} cases passed local validation; "
+        f"{stress_passed}/{stress_total} stress cells passed"
+    )
     print(f"Results: {run_dir / 'results.csv'}")
     print(f"Summary: {run_dir / 'summary.md'}")
     print(f"Manual queue: {run_dir / 'manual_queue.csv'}")
