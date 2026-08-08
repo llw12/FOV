@@ -1,33 +1,180 @@
-"""Decode an FOV v1 QR-frame video back to its original file."""
+"""Bounded-memory FOV v1 QR video decoder."""
 
 from __future__ import annotations
 
 import argparse
 import base64
-import math
 import os
 import tempfile
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import cv2
 import zxingcpp
+from pyraptorq import Decoder
 
-from fov import (MetaPacket, MetadataError, PacketError, SymbolPacket, decode_block,
-                 derive_block_layout, file_id_from_sha256, make_raptorq_engine, parse_packet, sha256_file,
-                 safe_filename, validate_metadata)
+from fov import (BlockLayout, MetaPacket, MetadataError, PacketError, SymbolPacket, file_id_from_sha256,
+                 make_raptorq_engine, parse_packet, safe_filename, sha256_file, validate_metadata)
 
 ROI_SIZE = 700
+PREMETA_MAX_SYMBOLS = 4_096
+PREMETA_MAX_BYTES = 16 * 1024 * 1024
+PREMETA_MAX_FILE_IDS = 4
+
+
+def bit_is_set(bitmap: bytearray, index: int) -> bool:
+    return bool(bitmap[index // 8] & (1 << (index % 8)))
+
+
+def set_bit(bitmap: bytearray, index: int) -> None:
+    bitmap[index // 8] |= 1 << (index % 8)
 
 
 @dataclass
-class PacketCollection:
-    metadata_by_file_id: dict[bytes, dict[str, Any]] = field(default_factory=dict)
-    conflicting_file_ids: set[bytes] = field(default_factory=set)
-    symbols_by_file: dict[bytes, dict[int, dict[int, bytes]]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(dict)))
-    stats: Counter[str] = field(default_factory=Counter)
+class PreMetaBuffer:
+    max_symbols: int = PREMETA_MAX_SYMBOLS
+    max_bytes: int = PREMETA_MAX_BYTES
+    max_file_ids: int = PREMETA_MAX_FILE_IDS
+    entries: OrderedDict[tuple[bytes, int, int], bytes] = field(default_factory=OrderedDict)
+    total_bytes: int = 0
+    evicted_symbols: int = 0
+    evicted_bytes: int = 0
+
+    def add(self, packet: SymbolPacket) -> bool:
+        key = (packet.file_id, packet.block_id, packet.symbol_id)
+        if key in self.entries:
+            return False
+        if len(packet.payload) > self.max_bytes:
+            self.evicted_symbols += 1
+            self.evicted_bytes += len(packet.payload)
+            return False
+        self.entries[key] = packet.payload
+        self.total_bytes += len(packet.payload)
+        self._evict_to_limits()
+        return key in self.entries
+
+    def take_for_file(self, file_id: bytes) -> list[SymbolPacket]:
+        selected = [SymbolPacket(entry_file_id, block_id, symbol_id, payload)
+                    for (entry_file_id, block_id, symbol_id), payload in self.entries.items()
+                    if entry_file_id == file_id]
+        self.clear()
+        return selected
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.total_bytes = 0
+
+    def _evict_to_limits(self) -> None:
+        while (len(self.entries) > self.max_symbols or self.total_bytes > self.max_bytes
+               or len({file_id for file_id, _, _ in self.entries}) > self.max_file_ids):
+            _, payload = self.entries.popitem(last=False)
+            self.total_bytes -= len(payload)
+            self.evicted_symbols += 1
+            self.evicted_bytes += len(payload)
+
+
+@dataclass
+class BlockDecodeState:
+    layout: BlockLayout
+    decoder: Any
+    seen_bitmap: bytearray
+    received_unique: int = 0
+
+
+class StreamingDecodeSession:
+    """Feeds symbols directly into native decoders and writes completed blocks immediately."""
+
+    def __init__(self, file_id: bytes, metadata: dict[str, Any], output_dir: Path, engine: Any) -> None:
+        self.file_id = file_id
+        self.metadata = metadata
+        self.layout = validate_metadata(metadata)
+        self.engine = engine
+        self.block_states: dict[int, BlockDecodeState] = {}
+        self.decoded_bitmap = bytearray((len(self.layout) + 7) // 8)
+        self.decoded_block_count = 0
+        self.stats: Counter[str] = Counter()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.target = output_path(output_dir, metadata["filename"])
+        descriptor, temporary_name = tempfile.mkstemp(prefix="fov-recover-", suffix=".tmp", dir=output_dir)
+        os.close(descriptor)
+        self.temporary = Path(temporary_name)
+        self._file = self.temporary.open("w+b")
+        self._file.truncate(metadata["original_size"])
+
+    def feed(self, packet: SymbolPacket) -> None:
+        if packet.file_id != self.file_id:
+            self.stats["foreign_symbols"] += 1
+            return
+        if packet.block_id >= len(self.layout):
+            self.stats["invalid_symbols"] += 1
+            return
+        layout = self.layout[packet.block_id]
+        if packet.symbol_id >= layout.encoded_symbols or len(packet.payload) != self.metadata["symbol_size"]:
+            self.stats["invalid_symbols"] += 1
+            return
+        if bit_is_set(self.decoded_bitmap, packet.block_id):
+            self.stats["post_decode_symbols"] += 1
+            return
+        state = self.block_states.get(packet.block_id)
+        if state is None:
+            state = BlockDecodeState(layout, Decoder(layout.source_symbols, self.metadata["symbol_size"], layout.data_size, self.engine),
+                                     bytearray((layout.encoded_symbols + 7) // 8))
+            self.block_states[packet.block_id] = state
+        if bit_is_set(state.seen_bitmap, packet.symbol_id):
+            self.stats["duplicate_symbols"] += 1
+            return
+        set_bit(state.seen_bitmap, packet.symbol_id)
+        state.received_unique += 1
+        if not state.decoder.add_symbol(packet.symbol_id, packet.payload):
+            raise RuntimeError(f"RaptorQ native add_symbol failed: block_id={packet.block_id}, symbol_id={packet.symbol_id}")
+        self.stats["valid_symbols"] += 1
+        if state.decoder.may_try_decode():
+            result = state.decoder.try_decode()
+            if result is not None:
+                self._write_completed_block(state, result)
+
+    def failure_summary(self) -> str:
+        failures = []
+        for block in self.layout:
+            if bit_is_set(self.decoded_bitmap, block.block_id):
+                continue
+            state = self.block_states.get(block.block_id)
+            received = state.received_unique if state else 0
+            failures.append(f"block_id={block.block_id}, K={block.source_symbols}, N={block.encoded_symbols}, received_unique={received}, received/K={received / block.source_symbols:.2f}")
+        return "; ".join(failures)
+
+    def finalize(self) -> Path:
+        if self.decoded_block_count != len(self.layout):
+            raise RuntimeError(f"RaptorQ decode failed: {self.failure_summary()}")
+        self._file.flush()
+        self._file.close()
+        actual_sha256 = sha256_file(self.temporary)
+        print(f"\nOriginal SHA256: {self.metadata['sha256']}\nRecovered SHA256: {actual_sha256}")
+        if actual_sha256 != self.metadata["sha256"]:
+            raise RuntimeError("SHA256 mismatch")
+        self.temporary.replace(self.target)
+        print(f"[OK] File fully recovered\nOutput: {self.target}")
+        return self.target
+
+    def cleanup(self) -> None:
+        if not self._file.closed:
+            self._file.close()
+        self.temporary.unlink(missing_ok=True)
+
+    def _write_completed_block(self, state: BlockDecodeState, result: bytes) -> None:
+        block = state.layout
+        if len(result) < block.data_size:
+            raise RuntimeError(f"RaptorQ returned a short block: block_id={block.block_id}")
+        self._file.seek(block.block_id * self.metadata["block_size"])
+        self._file.write(result[:block.data_size])
+        self._file.flush()
+        set_bit(self.decoded_bitmap, block.block_id)
+        self.decoded_block_count += 1
+        self.stats["decoded_blocks"] += 1
+        print(f"Block {block.block_id}:\n  K: {block.source_symbols}\n  N: {block.encoded_symbols}\n  received unique: {state.received_unique}\n  received/K: {state.received_unique / block.source_symbols:.2f}\n  [OK]")
+        del self.block_states[block.block_id]
 
 
 def decode_qr(frame) -> str | None:
@@ -48,115 +195,94 @@ def decode_qr(frame) -> str | None:
     return None
 
 
-def collect_packet(collection: PacketCollection, packet: MetaPacket | SymbolPacket) -> None:
-    """Collect CRC-valid packets without assuming META arrives first."""
-    if isinstance(packet, MetaPacket):
-        try:
-            validate_metadata(packet.metadata)
-            if file_id_from_sha256(packet.metadata["sha256"]) != packet.file_id:
-                raise MetadataError("META file_id does not match SHA256")
-        except (KeyError, TypeError, ValueError, MetadataError):
-            collection.stats["invalid_meta"] += 1
-            return
-        previous = collection.metadata_by_file_id.get(packet.file_id)
-        if previous is None:
-            collection.metadata_by_file_id[packet.file_id] = packet.metadata
-            collection.stats["valid_meta"] += 1
-        elif previous != packet.metadata:
-            collection.conflicting_file_ids.add(packet.file_id)
-            collection.stats["conflicting_meta"] += 1
-        else:
-            collection.stats["valid_meta"] += 1
-        return
-    file_symbols = collection.symbols_by_file[packet.file_id][packet.block_id]
-    if packet.symbol_id in file_symbols:
-        collection.stats["duplicate_symbols"] += 1
-        return
-    file_symbols[packet.symbol_id] = packet.payload
-    collection.stats["valid_symbols"] += 1
-    if packet.file_id not in collection.metadata_by_file_id:
-        collection.stats["symbols_before_meta"] += 1
-
-
-def select_metadata(collection: PacketCollection) -> tuple[bytes, dict[str, Any]]:
-    candidates = [(file_id, metadata) for file_id, metadata in collection.metadata_by_file_id.items()
-                  if file_id not in collection.conflicting_file_ids]
-    if not candidates:
-        if collection.conflicting_file_ids:
-            raise RuntimeError("conflicting META detected")
-        raise RuntimeError("no valid META packet found")
-    if len(candidates) != 1:
-        raise RuntimeError("multiple FOV files detected")
-    return candidates[0]
-
-
 def output_path(output_dir: Path, filename: str) -> Path:
-    target = output_dir / safe_filename(filename)
-    return target if not target.exists() else output_dir / f"recovered_{safe_name}"
+    safe_name = safe_filename(filename)
+    candidate = output_dir / safe_name
+    if not candidate.exists():
+        return candidate
+    candidate = output_dir / f"recovered_{safe_name}"
+    attempt = 2
+    while candidate.exists():
+        candidate = output_dir / f"recovered_{attempt}_{safe_name}"
+        attempt += 1
+    return candidate
+
+
+def _validate_meta(packet: MetaPacket) -> None:
+    validate_metadata(packet.metadata)
+    if file_id_from_sha256(packet.metadata["sha256"]) != packet.file_id:
+        raise MetadataError("META file_id does not match SHA256")
+
+
+def _print_stats(stats: Counter[str], premeta: PreMetaBuffer, session: StreamingDecodeSession) -> None:
+    print(f"\nQR:\n  decoded: {stats['qr_decoded']}\n  failed: {stats['qr_failed']}\n\nPackets:\n  valid META: {stats['valid_meta']}\n  invalid META: {stats['invalid_meta']}\n  CRC failed: {stats['crc_failed']}\n  duplicate symbol: {session.stats['duplicate_symbols']}\n  post-decode symbols: {session.stats['post_decode_symbols']}\n  symbols before META: {stats['symbols_before_meta']}\n  pre-META cached: {stats['premeta_cached']}\n  pre-META evicted: {premeta.evicted_symbols} ({premeta.evicted_bytes} bytes)\n  foreign symbols: {session.stats['foreign_symbols']}\n  active block decoders: {len(session.block_states)}\n  decoded blocks: {session.decoded_block_count}\n  selected file_id: {session.file_id.hex()}")
 
 
 def decode(video_path: Path, output_dir: Path) -> Path:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"cannot open video: {video_path}")
-    collection = PacketCollection()
-    collection.stats["total_frames"] = 0
+    stats: Counter[str] = Counter()
+    premeta = PreMetaBuffer()
+    session: StreamingDecodeSession | None = None
     print(f"FOV v1 Decoder\n\nVideo: {video_path}\nTotal frames: {int(capture.get(cv2.CAP_PROP_FRAME_COUNT))}")
-    while True:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        collection.stats["total_frames"] += 1
-        text = decode_qr(frame)
-        if not text:
-            collection.stats["qr_failed"] += 1
-            continue
-        collection.stats["qr_decoded"] += 1
-        try:
-            packet = parse_packet(base64.b64decode(text, validate=True))
-        except PacketError as exc:
-            collection.stats["crc_failed" if "CRC32" in str(exc) else "invalid_packets"] += 1
-            continue
-        except (ValueError, UnicodeEncodeError):
-            collection.stats["invalid_packets"] += 1
-            continue
-        collect_packet(collection, packet)
-    capture.release()
-    file_id, metadata = select_metadata(collection)
-    layout = validate_metadata(metadata)
-    selected_symbols = collection.symbols_by_file.get(file_id, {})
-    print(f"\nQR:\n  decoded: {collection.stats['qr_decoded']}\n  failed: {collection.stats['qr_failed']}\n\nPackets:\n  valid META: {collection.stats['valid_meta']}\n  invalid META: {collection.stats['invalid_meta']}\n  conflicting META: {collection.stats['conflicting_meta']}\n  valid SYMBOL: {collection.stats['valid_symbols']}\n  CRC failed: {collection.stats['crc_failed']}\n  duplicate symbol: {collection.stats['duplicate_symbols']}\n  symbol before META: {collection.stats['symbols_before_meta']}\n  selected file_id: {file_id.hex()}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = output_path(output_dir, metadata["filename"])
-    descriptor, temporary_name = tempfile.mkstemp(prefix="fov-recover-", suffix=".tmp", dir=output_dir)
-    os.close(descriptor)
-    temporary = Path(temporary_name)
     try:
-        engine = make_raptorq_engine()
-        with temporary.open("wb") as recovered:
-            for block in layout:
-                received = selected_symbols.get(block.block_id, {})
-                usable = {symbol_id: payload for symbol_id, payload in received.items()
-                          if symbol_id < block.encoded_symbols and len(payload) == metadata["symbol_size"]}
-                ratio = len(usable) / block.source_symbols
-                print(f"\nBlock {block.block_id}:\n  K: {block.source_symbols}\n  N: {block.encoded_symbols}\n  received unique: {len(usable)}\n  received / K: {ratio:.2f}\n  decoding...")
-                result = decode_block(block.data_size, metadata["symbol_size"], usable, engine)
-                if result is None:
-                    raise RuntimeError(f"RaptorQ decode failed: block_id={block.block_id}, K={block.source_symbols}, received={len(usable)}, received/K={ratio:.2f}")
-                recovered.write(result)
-                print(f"Block {block.block_id}: [OK]")
-        actual_sha256 = sha256_file(temporary)
-        print(f"\nOriginal SHA256: {metadata['sha256']}\nRecovered SHA256: {actual_sha256}")
-        if actual_sha256 != metadata["sha256"]:
-            raise RuntimeError("SHA256 mismatch")
-        temporary.replace(target)
-        print(f"[OK] File fully recovered\nOutput: {target}")
-        return target
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            text = decode_qr(frame)
+            if not text:
+                stats["qr_failed"] += 1
+                continue
+            stats["qr_decoded"] += 1
+            try:
+                packet = parse_packet(base64.b64decode(text, validate=True))
+            except PacketError as exc:
+                stats["crc_failed" if "CRC32" in str(exc) else "invalid_packets"] += 1
+                continue
+            except (ValueError, UnicodeEncodeError):
+                stats["invalid_packets"] += 1
+                continue
+            if isinstance(packet, SymbolPacket):
+                if session is None:
+                    if premeta.add(packet):
+                        stats["premeta_cached"] += 1
+                        stats["symbols_before_meta"] += 1
+                    else:
+                        stats["duplicate_symbols"] += 1
+                else:
+                    session.feed(packet)
+                continue
+            try:
+                _validate_meta(packet)
+            except (KeyError, TypeError, ValueError, MetadataError):
+                stats["invalid_meta"] += 1
+                continue
+            if session is None:
+                session = StreamingDecodeSession(packet.file_id, packet.metadata, output_dir, make_raptorq_engine())
+                stats["valid_meta"] += 1
+                for cached in premeta.take_for_file(packet.file_id):
+                    session.feed(cached)
+            elif packet.file_id != session.file_id:
+                raise RuntimeError("multiple FOV files detected")
+            elif packet.metadata != session.metadata:
+                raise RuntimeError("conflicting META detected")
+            else:
+                stats["valid_meta"] += 1
     except BaseException:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if session is not None:
+            session.cleanup()
+        raise
+    finally:
+        capture.release()
+    if session is None:
+        raise RuntimeError("no valid META packet found")
+    try:
+        _print_stats(stats, premeta, session)
+        return session.finalize()
+    except BaseException:
+        session.cleanup()
         raise
 
 

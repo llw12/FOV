@@ -95,7 +95,9 @@ B0-S0, B1-S0, B2-S0, B3-S0, B0-S1, ...
 
 每个 symbol 在即将生成 QR 帧时才调用 `encoder.gen_symbol()`；不会将所有 RaptorQ symbols 放入列表。编码内存近似为 `O(INTERLEAVE_WINDOW × BLOCK_SIZE)`，而不是整个文件大小。RaptorQ engine 在整个编码/解码进程中复用。
 
-解码扫描不要求 META 先到：所有 CRC 正确的 SYMBOL 会按 `file_id → block_id → symbol_id` 收集；扫描结束后只接受唯一且无冲突的合法 META。多个合法文件或同一 file_id 的冲突 META 都会明确失败。所有 block 成功、最终 SHA256 一致后才会原子性写出恢复文件。
+解码扫描不要求 META 先到，但也不会保存整段视频的 symbol payload。META 到达前，`PreMetaBuffer` 按 oldest-first 暂存最多 4,096 个 symbol、16 MiB payload、4 个 file ID；超出的旧 symbol 被淘汰并作为 RaptorQ erasure。META 到达后，匹配的缓存 symbol 立即回灌，其余缓存被释放。
+
+之后每个合法 SYMBOL 直接送入该 block 的 native RaptorQ decoder。block 首次收到 symbol 时才创建 decoder；重复检测使用 `bytearray` 位图而非 `set[int]`。block 恢复后立即按 `block_id * block_size` 随机写入临时文件，释放 decoder 与位图。因而 decoder 内存接近 `O(active decoders + bounded pre-META cache)`，不再是 `O(all received symbol payloads)`。多个合法文件或同一 file_id 的冲突 META 都会明确失败；所有 block 恢复且 SHA256 一致后才会原子性写出恢复文件。
 
 ## 默认参数与约束
 

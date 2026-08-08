@@ -13,7 +13,8 @@ from fov import (MAX_BLOCK_COUNT, MAX_SOURCE_SYMBOLS, BlockLayout, MetaPacket, M
                  SymbolPacket, build_metadata, decode_block, derive_block_layout, encode_block, encode_meta,
                  encode_symbol, encoded_symbol_count, file_id_from_sha256, iter_encoded_symbols,
                  make_raptorq_engine, parse_packet, sha256_bytes, source_symbol_count, validate_metadata)
-from video2file import PacketCollection, collect_packet, select_metadata
+import video2file
+from video2file import (PreMetaBuffer, StreamingDecodeSession, bit_is_set, output_path, set_bit)
 
 
 def metadata_for(data: bytes, *, block_size: int = 1_000) -> dict:
@@ -109,45 +110,197 @@ def test_invalid_metadata_fails_safely(mutator) -> None:
         validate_metadata(metadata)
 
 
-def test_symbols_before_meta_are_collected_and_decoded() -> None:
+def test_output_path_uses_original_when_available(tmp_path) -> None:
+    assert output_path(tmp_path, "../input.bin") == tmp_path / "input.bin"
+
+
+def test_output_path_avoids_existing_file(tmp_path) -> None:
+    (tmp_path / "input.bin").write_bytes(b"old")
+    assert output_path(tmp_path, "input.bin") == tmp_path / "recovered_input.bin"
+
+
+def test_output_path_handles_multiple_existing_recovered_files(tmp_path) -> None:
+    for name in ("input.bin", "recovered_input.bin", "recovered_2_input.bin"):
+        (tmp_path / name).write_bytes(b"old")
+    assert output_path(tmp_path, "input.bin") == tmp_path / "recovered_3_input.bin"
+
+
+def test_premeta_buffer_is_bounded_and_evicts() -> None:
+    buffer = PreMetaBuffer(max_symbols=3, max_bytes=5, max_file_ids=2)
+    for symbol_id in range(5):
+        buffer.add(SymbolPacket(bytes([symbol_id % 3]) * 8, 0, symbol_id, b"xx"))
+    assert len(buffer.entries) <= 3
+    assert buffer.total_bytes <= 5
+    assert len({file_id for file_id, _, _ in buffer.entries}) <= 2
+    assert buffer.evicted_symbols > 0
+    assert buffer.evicted_bytes > 0
+
+
+def _feed_all_symbols(session: StreamingDecodeSession, data: bytes, metadata: dict, engine, *, reverse_blocks: bool = False) -> None:
+    layout = validate_metadata(metadata)
+    blocks = list(layout)
+    if reverse_blocks:
+        blocks.reverse()
+    for block in blocks:
+        source = data[block.block_id * metadata["block_size"]:block.block_id * metadata["block_size"] + block.data_size]
+        for symbol_id, payload in enumerate(encode_block(source, metadata["symbol_size"], block.encoded_symbols, engine)):
+            session.feed(SymbolPacket(session.file_id, block.block_id, symbol_id, payload))
+
+
+def test_symbols_before_meta_flush_into_streaming_session(tmp_path) -> None:
     data = os.urandom(500)
     metadata = metadata_for(data)
     file_id = file_id_from_sha256(metadata["sha256"])
-    block = validate_metadata(metadata)[0]
     engine = make_raptorq_engine()
+    block = validate_metadata(metadata)[0]
+    buffer = PreMetaBuffer()
     symbols = encode_block(data, 200, block.encoded_symbols, engine)
-    collection = PacketCollection()
-    for symbol_id, payload in enumerate(symbols[:3]):
-        collect_packet(collection, SymbolPacket(file_id, 0, symbol_id, payload))
-    collect_packet(collection, MetaPacket(file_id, metadata))
-    for symbol_id, payload in enumerate(symbols[3:], 3):
-        collect_packet(collection, SymbolPacket(file_id, 0, symbol_id, payload))
-    selected_id, selected_meta = select_metadata(collection)
-    assert selected_id == file_id and selected_meta == metadata
-    assert collection.stats["symbols_before_meta"] == 3
-    assert decode_block(len(data), 200, collection.symbols_by_file[file_id][0], engine) == data
+    for symbol_id, payload in enumerate(symbols[:2]):
+        buffer.add(SymbolPacket(file_id, 0, symbol_id, payload))
+    session = StreamingDecodeSession(file_id, metadata, tmp_path, engine)
+    for packet in buffer.take_for_file(file_id):
+        session.feed(packet)
+    for symbol_id, payload in enumerate(symbols[2:], 2):
+        session.feed(SymbolPacket(file_id, 0, symbol_id, payload))
+    assert session.finalize().read_bytes() == data
 
 
-def test_conflicting_meta_is_rejected() -> None:
-    data = b"data"
-    metadata = metadata_for(data)
-    file_id = file_id_from_sha256(metadata["sha256"])
-    collection = PacketCollection()
-    collect_packet(collection, MetaPacket(file_id, metadata))
-    conflicting = dict(metadata)
-    conflicting["filename"] = "other.bin"
-    collect_packet(collection, MetaPacket(file_id, conflicting))
-    with pytest.raises(RuntimeError, match="conflicting META"):
-        select_metadata(collection)
+def test_streaming_decoder_writes_blocks_immediately_and_handles_out_of_order_blocks(tmp_path) -> None:
+    data = os.urandom(700)
+    metadata = metadata_for(data, block_size=200)
+    engine = make_raptorq_engine()
+    session = StreamingDecodeSession(file_id_from_sha256(metadata["sha256"]), metadata, tmp_path, engine)
+    first = validate_metadata(metadata)[0]
+    first_data = data[:first.data_size]
+    for symbol_id, payload in enumerate(encode_block(first_data, 200, first.encoded_symbols, engine)):
+        session.feed(SymbolPacket(session.file_id, 0, symbol_id, payload))
+    assert bit_is_set(session.decoded_bitmap, 0)
+    assert 0 not in session.block_states
+    with session.temporary.open("rb") as temporary:
+        assert temporary.read(first.data_size) == first_data
+    _feed_all_symbols(session, data, metadata, engine, reverse_blocks=True)
+    assert session.finalize().read_bytes() == data
 
 
-def test_multiple_file_ids_are_rejected() -> None:
-    collection = PacketCollection()
-    for data in (b"first", b"second"):
-        metadata = metadata_for(data)
-        collect_packet(collection, MetaPacket(file_id_from_sha256(metadata["sha256"]), metadata))
-    with pytest.raises(RuntimeError, match="multiple FOV files"):
-        select_metadata(collection)
+def test_duplicate_bitmap_only_calls_native_decoder_once(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    class FakeDecoder:
+        def __init__(self, *args):
+            pass
+
+        def add_symbol(self, symbol_id, payload):
+            calls.append(symbol_id)
+            return True
+
+        def may_try_decode(self):
+            return False
+
+    monkeypatch.setattr(video2file, "Decoder", FakeDecoder)
+    data = b"x"
+    metadata = build_metadata("input.bin", 1, sha256_bytes(data), 1, 0.0, 1)
+    session = StreamingDecodeSession(file_id_from_sha256(metadata["sha256"]), metadata, tmp_path, object())
+    packet = SymbolPacket(session.file_id, 0, 0, b"x")
+    session.feed(packet)
+    session.feed(packet)
+    assert calls == [0]
+    assert session.stats["duplicate_symbols"] == 1
+    session.cleanup()
+
+
+def test_streaming_session_does_not_store_all_symbol_payloads(monkeypatch, tmp_path) -> None:
+    class FakeDecoder:
+        def __init__(self, *args):
+            pass
+
+        def add_symbol(self, symbol_id, payload):
+            return True
+
+        def may_try_decode(self):
+            return False
+
+    monkeypatch.setattr(video2file, "Decoder", FakeDecoder)
+    data_size = 10_000
+    metadata = build_metadata("large.bin", data_size, sha256_bytes(b"x" * data_size), 1, 0.0, data_size)
+    session = StreamingDecodeSession(file_id_from_sha256(metadata["sha256"]), metadata, tmp_path, object())
+    for symbol_id in range(data_size):
+        session.feed(SymbolPacket(session.file_id, 0, symbol_id, b"x"))
+    state = session.block_states[0]
+    assert len(state.seen_bitmap) == (data_size + 7) // 8
+    assert not hasattr(session, "symbols_by_file")
+    assert state.received_unique == data_size
+    session.cleanup()
+
+
+def test_decode_failures_and_sha_mismatch_clean_temp(monkeypatch, tmp_path) -> None:
+    class NeverDecoder:
+        def __init__(self, *args):
+            pass
+
+        def add_symbol(self, symbol_id, payload):
+            return True
+
+        def may_try_decode(self):
+            return False
+
+    monkeypatch.setattr(video2file, "Decoder", NeverDecoder)
+    metadata = build_metadata("input.bin", 1, sha256_bytes(b"x"), 1, 0.0, 1)
+    failed = StreamingDecodeSession(file_id_from_sha256(metadata["sha256"]), metadata, tmp_path, object())
+    with pytest.raises(RuntimeError, match="RaptorQ decode failed"):
+        failed.finalize()
+    failed.cleanup()
+    assert not failed.temporary.exists()
+
+    class WrongDecoder(NeverDecoder):
+        def may_try_decode(self):
+            return True
+
+        def try_decode(self):
+            return b"y"
+
+    monkeypatch.setattr(video2file, "Decoder", WrongDecoder)
+    mismatch = StreamingDecodeSession(file_id_from_sha256(metadata["sha256"]), metadata, tmp_path, object())
+    mismatch.feed(SymbolPacket(mismatch.file_id, 0, 0, b"x"))
+    with pytest.raises(RuntimeError, match="SHA256 mismatch"):
+        mismatch.finalize()
+    mismatch.cleanup()
+    assert not mismatch.temporary.exists()
+    assert not (tmp_path / "input.bin").exists()
+
+
+@pytest.mark.parametrize("second_metadata, message", [
+    (lambda metadata: dict(metadata, filename="other.bin"), "conflicting META"),
+    (lambda metadata: build_metadata("second.bin", 1, sha256_bytes(b"z"), 1, 0.0, 1), "multiple FOV files"),
+])
+def test_decode_rejects_conflicting_or_multiple_meta_and_releases_capture(monkeypatch, tmp_path, second_metadata, message) -> None:
+    metadata = build_metadata("input.bin", 1, sha256_bytes(b"x"), 1, 0.0, 1)
+    second = second_metadata(metadata)
+    packets = [MetaPacket(file_id_from_sha256(metadata["sha256"]), metadata),
+               MetaPacket(file_id_from_sha256(second["sha256"]), second)]
+
+    class FakeCapture:
+        released = False
+
+        def isOpened(self):
+            return True
+
+        def get(self, _):
+            return len(packets)
+
+        def read(self):
+            return (True, object()) if packets else (False, None)
+
+        def release(self):
+            self.released = True
+
+    capture = FakeCapture()
+    monkeypatch.setattr(video2file.cv2, "VideoCapture", lambda path: capture)
+    monkeypatch.setattr(video2file, "decode_qr", lambda frame: "eA==")
+    monkeypatch.setattr(video2file, "parse_packet", lambda data: packets.pop(0))
+    monkeypatch.setattr(video2file, "make_raptorq_engine", lambda: object())
+    with pytest.raises(RuntimeError, match=message):
+        video2file.decode(tmp_path / "video.mp4", tmp_path)
+    assert capture.released
 
 
 def test_lazy_symbol_generator_generates_on_demand(monkeypatch) -> None:
