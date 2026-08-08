@@ -99,6 +99,8 @@ B0-S0, B1-S0, B2-S0, B3-S0, B0-S1, ...
 
 之后每个合法 SYMBOL 直接送入该 block 的 native RaptorQ decoder。block 首次收到 symbol 时才创建 decoder；重复检测使用 `bytearray` 位图而非 `set[int]`。block 恢复后立即按 `block_id * block_size` 随机写入临时文件，释放 decoder 与位图。因而 decoder 内存接近 `O(active decoders + bounded pre-META cache)`，不再是 `O(all received symbol payloads)`。多个合法文件或同一 file_id 的冲突 META 都会明确失败；所有 block 恢复且 SHA256 一致后才会原子性写出恢复文件。
 
+为便于分析真实转码信道，decoder 还会输出 QR 失败帧索引（0-based，最多保留前 512 个，超出会标记 truncated）、每个 block 的 `decoded at frame`，以及恢复前实际收到的 source/repair symbol 数。这样可以判断失败是随机分散还是 burst，并定位 RaptorQ 在视频时间轴上的恢复位置，而不会为了诊断重新引入无界内存。
+
 ## 默认参数与约束
 
 | 参数 | 默认值 |
@@ -116,12 +118,36 @@ QR ECC 处理帧内错误；CRC32 将损坏 packet 转为 erasure；RaptorQ 处�
 
 ## 自动参数扫描
 
-`scripts/scan_params.py` 会批量生成 FOV 视频、做本地解码校验，再用 FFmpeg 进行一次可重复的“平台式”H.264 二次压缩并再次解码。脚本把每一步日志和结果保存在独立 run 目录，并生成用于后续人工平台验证的候选列表。
+`scripts/scan_params.py` 现在按“视觉参数 × stress bitrate”二维矩阵工作。每个 case 只生成一次 `source.mp4` 并做一次本地 SHA256 校验，然后把同一个 source 依次经过多个 FFmpeg 压力档位，再逐个解码并记录 QR 擦除、失败帧索引、恢复帧位置和最终 SHA256。
 
-默认 targeted 扫描覆盖当前最有价值的参数区间：720p 的 200/240/280 B，以及 1080p 的 400/500/600/700 B，默认 repair=20%。
+默认 targeted 视觉参数仍覆盖：720p 的 200/240/280 B，以及 1080p 的 400/500/600/700 B；默认 repair=20%。默认 stress 输出统一为 1280×720、bicubic，并扫描 2100/1400/1000/700 kbps。这个阶梯是可重复的工程筛选模型，不声称精确复现任何平台私有转码器。
 
 ```powershell
 python .\scripts\scan_params.py --input .\test.zip
+```
+
+单独扫描当前 1080p + 500B case：
+
+```powershell
+python .\scripts\scan_params.py `
+  --input .\test.zip `
+  --case 1920x1080:500:0.20 `
+  --stress-bitrates 2100 1400 1000 700 `
+  --keep-stress-videos `
+  --verbose
+```
+
+也可以改变 stress 输出和 scaler：
+
+```powershell
+python .\scripts\scan_params.py `
+  --case 1920x1080:500:0.20 `
+  --case 1920x1080:600:0.20 `
+  --case 1920x1080:700:0.20 `
+  --stress-width 1280 `
+  --stress-height 720 `
+  --stress-scale bicubic `
+  --stress-bitrates 2100 1400 1000 700
 ```
 
 扫描结束会生成：
@@ -137,11 +163,15 @@ runs/scan-YYYYMMDD-HHMMSS/
     source.mp4
     encode.log
     local_decode.log
-    sim_ffmpeg.log
-    sim_decode.log
+    stress/<profile>/
+      ffmpeg.log
+      decode.log
+      video.mp4       # 仅 --keep-stress-videos 时保留
 ```
 
-`source.mp4` 始终保留，供人工上传平台验证；`manual_queue.csv` 只列出本地和模拟压缩都成功的组合，并按有效文件吞吐量从高到低排序。人工验证时上传 `source.mp4`，不要上传 `sim_platform.mp4`。
+`results.csv` 是展开后的 case × bitrate 表；`summary.md` 直接展示每个 symbol_size 在各 stress bitrate 下的 PASS/FAIL 与 QR failed/total。`manual_queue.csv` 只保留本地通过且至少通过一个 stress 档位的 case，并记录 `stress_pass_floor_kbps`（仍能恢复的最低已测码率），供后续人工上传真实平台时按吞吐和鲁棒性筛选。
+
+`source.mp4` 始终保留，人工平台验证应上传 source，而不是 stress MP4。`manual_queue.csv` 预留了平台 QR/CRC/SHA256/失败帧索引字段，方便把真实平台结果与自动 stress 结果并排比较。
 
 可一次扫描多个 repair ratio：
 
@@ -149,24 +179,7 @@ runs/scan-YYYYMMDD-HHMMSS/
 python .\scripts\scan_params.py --repairs 0.10 0.20 0.30
 ```
 
-也可以只验证指定组合；`--case` 可重复：
-
-```powershell
-python .\scripts\scan_params.py `
-  --case 1920x1080:500:0.20 `
-  --case 1920x1080:600:0.20 `
-  --case 1920x1080:700:0.30
-```
-
-默认模拟 profile 使用 H.264 High、yuv420p、CFR、GOP 250、3 个 B-frame，并以约 900 kbps（720p）/1500 kbps（1080p）做 constrained-VBR 二次压缩。它只是可重复的 Bilibili-like 压缩近似，并不等同于平台私有转码器。得到更多真实平台 `ffprobe` 数据后，应使用参数覆盖来校准模拟码率：
-
-```powershell
-python .\scripts\scan_params.py `
-  --sim-bitrate-720 900 `
-  --sim-bitrate-1080 1800
-```
-
-默认模拟 MP4 在完成验证后删除以节省空间；加 `--keep-sim-videos` 可保留。加 `--verbose` 会在保存日志的同时把 FFmpeg/decoder 子进程输出实时打印到终端。
+默认 stress MP4 在完成验证后删除以节省空间；`--keep-stress-videos` 可保留，旧的 `--keep-sim-videos` 仍作为兼容别名。`--verbose` 会在保存日志的同时把 FFmpeg/decoder 子进程输出实时打印到终端。
 
 ## 测试
 
@@ -175,4 +188,4 @@ python -m compileall fov.py file2video.py video2file.py scripts tests
 python -m pytest -q
 ```
 
-单元测试不依赖 FFmpeg 或视频平台，覆盖 packet、CRC、RaptorQ 随机丢失、重复 symbol、多 block、固定 META、布局推导、metadata 边界、META 晚到、冲突、多文件、惰性生成、Windows DLL handle，以及参数扫描脚本的矩阵/日志解析 helper。
+单元测试不依赖 FFmpeg 或视频平台，覆盖 packet、CRC、RaptorQ 随机丢失、重复 symbol、多 block、固定 META、布局推导、metadata 边界、META 晚到、冲突、多文件、惰性生成、Windows DLL handle、decoder 帧诊断，以及参数扫描脚本的二维矩阵/日志解析 helper。
