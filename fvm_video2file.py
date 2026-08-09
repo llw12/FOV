@@ -12,6 +12,7 @@ from typing import Any
 import cv2
 
 from fov import MetaPacket, MetadataError, PacketError, SymbolPacket, make_raptorq_engine, parse_packet, sha256_file
+from fvm_diagnostics import FailureTracker, PacketDiagnostic
 from fvm_file_common import (FPS, HEIGHT, PHYSICAL_CONFIG, WIDTH, decode_transport_physical,
                              matrix_to_physical)
 from scripts.fvm0_common import decode_frame
@@ -58,12 +59,14 @@ class PacketRecoveryCoordinator:
         self.session: StreamingDecodeSession | None = None
         self.stats: Counter[str] = Counter()
 
-    def feed(self, packet_bytes: bytes, frame_index: int | None = None) -> None:
+    def feed(
+        self, packet_bytes: bytes, frame_index: int | None = None
+    ) -> MetaPacket | SymbolPacket | None:
         try:
             packet = parse_packet(packet_bytes)
         except PacketError as exc:
             self.stats["packet_crc_failed" if "CRC32" in str(exc) else "invalid_packets"] += 1
-            return
+            return None
         if isinstance(packet, SymbolPacket):
             self.stats["valid_symbols"] += 1
             if self.session is None:
@@ -74,13 +77,13 @@ class PacketRecoveryCoordinator:
                     self.stats["duplicate_symbols"] += 1
             else:
                 self.session.feed(packet, frame_index=frame_index)
-            return
+            return packet
         assert isinstance(packet, MetaPacket)
         try:
             _validate_meta(packet)
         except (KeyError, TypeError, ValueError, MetadataError):
             self.stats["invalid_meta"] += 1
-            return
+            return None
         if self.session is None:
             self.session = StreamingDecodeSession(
                 packet.file_id,
@@ -97,6 +100,7 @@ class PacketRecoveryCoordinator:
             raise RuntimeError("conflicting META detected")
         else:
             self.stats["valid_meta"] += 1
+        return packet
 
     def finalize(self) -> Path:
         if self.session is None:
@@ -173,6 +177,29 @@ def _record_index_diagnostics(result: dict[str, Any], indices: TransportIndexTra
     result["transport"]["out_of_order_count"] = indices.out_of_order
 
 
+def _record_failure_diagnostics(result: dict[str, Any], failures: FailureTracker) -> None:
+    result["rs_failures"] = failures.summary()
+
+
+def _print_failure_summary(summary: dict[str, Any]) -> None:
+    indices = summary["observed_indices"]
+    if len(indices) <= 20 and not summary["events_truncated"]:
+        index_text = ",".join(str(index) for index in indices) if indices else "-"
+    else:
+        index_text = ",".join(str(index) for index in indices[:20]) + "..."
+    distances = summary["inter_failure_distance_stats"]
+    distance_text = (
+        "-"
+        if distances["count"] == 0
+        else f"{distances['min']}/{distances['mean']:.2f}/{distances['max']}"
+    )
+    print(
+        f"RS failed frame indices (observed): {index_text}\n"
+        f"Longest consecutive RS failure burst: {summary['longest_consecutive_burst']}\n"
+        f"RS failure distance min/mean/max (observed frames): {distance_text}"
+    )
+
+
 def _packet_stats(coordinator: PacketRecoveryCoordinator) -> dict[str, int]:
     adapter = coordinator.stats
     session = coordinator.session.stats if coordinator.session is not None else Counter()
@@ -200,9 +227,11 @@ def decode(video_path: Path, output_dir: Path) -> Path:
     result = _base_result(video_path, width, height, actual_fps)
     coordinator = PacketRecoveryCoordinator(output_dir)
     indices = TransportIndexTracker()
+    failures = FailureTracker()
     if (width, height) != (WIDTH, HEIGHT):
         capture.release()
         result["failure"] = "video resolution does not match fixed FVM profile"
+        _record_failure_diagnostics(result, failures)
         _write_result(output_dir, result)
         raise RuntimeError(result["failure"])
     try:
@@ -210,6 +239,7 @@ def decode(video_path: Path, output_dir: Path) -> Path:
             ok, frame = capture.read()
             if not ok:
                 break
+            observed_frame_index = result["video"]["observed_frames"]
             result["video"]["observed_frames"] += 1
             bits, _ = decode_frame(frame, PHYSICAL_CONFIG)
             physical_result = decode_transport_physical(matrix_to_physical(bits))
@@ -224,16 +254,20 @@ def decode(video_path: Path, output_dir: Path) -> Path:
                 result["rs"]["correction_histogram"][str(count)] += occurrences
             if rs.logical is None:
                 result["transport"]["rs_frames_failed"] += 1
+                failures.observe_failure(observed_frame_index, rs)
                 continue
             result["transport"]["rs_frames_success"] += 1
             if physical_result.transport is None:
+                failures.observe_non_failure_without_transport()
                 key = _transport_error_key(physical_result.transport_error or "invalid header")
                 result["transport"][key] += 1
                 continue
             embedded_index = physical_result.transport.frame_index
             indices.observe(embedded_index)
-            coordinator.feed(physical_result.transport.packet, frame_index=embedded_index)
+            packet = coordinator.feed(physical_result.transport.packet, frame_index=embedded_index)
+            failures.observe_success(embedded_index, PacketDiagnostic.from_packet(packet))
         _record_index_diagnostics(result, indices)
+        _record_failure_diagnostics(result, failures)
         recovered = coordinator.finalize()
         assert coordinator.session is not None
         session = coordinator.session
@@ -252,15 +286,18 @@ def decode(video_path: Path, output_dir: Path) -> Path:
             "exact": recovered_sha == session.metadata["sha256"],
         }
         _write_result(output_dir, result)
+        failure_summary = result["rs_failures"]
         print(
             f"FVM decode complete: {recovered}\nRS failed frames: {result['transport']['rs_frames_failed']}\n"
             f"Transport CRC failures: {result['transport']['transport_crc_failures']}\n"
             f"Packet CRC failures: {result['packets'].get('packet_crc_failed', 0)}"
         )
+        _print_failure_summary(failure_summary)
         return recovered
     except BaseException as exc:
         coordinator.cleanup()
         _record_index_diagnostics(result, indices)
+        _record_failure_diagnostics(result, failures)
         result["packets"] = _packet_stats(coordinator)
         if coordinator.session is not None:
             session = coordinator.session

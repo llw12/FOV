@@ -14,9 +14,11 @@ from fvm_file_common import (CODED_RS_BYTES, LOGICAL_BYTES, MAGIC, MAX_PACKET_BY
                              VERSION, TRANSPORT_HEADER, TransportError, decode_transport_physical,
                              encode_transport_physical, matrix_to_physical, physical_to_matrix,
                              unwrap_packet, wrap_packet)
+from fvm_diagnostics import FailureTracker, PacketDiagnostic
 from fvm_video2file import (PacketRecoveryCoordinator, TransportIndexTracker, _write_result,
                             result_path)
-from scripts.fvm0_rs_common import deinterleave, interleave
+from scripts.fvm0_rs_common import (RS_CODEWORDS, RSDecodeResult, decode_rs_codewords, deinterleave,
+                                    encode_logical, interleave)
 
 
 def _rewrite_crc(logical: bytearray) -> bytes:
@@ -27,6 +29,22 @@ def _rewrite_crc(logical: bytearray) -> bytes:
 def _metadata(filename: str, data: bytes) -> tuple[dict, bytes]:
     digest = sha256_bytes(data)
     return build_metadata(filename, len(data), digest, 6400, 0.10), file_id_from_sha256(digest)
+
+
+def _failed_rs(*failed_indices: int) -> RSDecodeResult:
+    corrections = tuple(None if index in failed_indices else 0 for index in range(RS_CODEWORDS))
+    histogram = {index: 0 for index in range(9)}
+    histogram[0] = RS_CODEWORDS - len(failed_indices)
+    return RSDecodeResult(
+        logical=None,
+        codeword_successes=RS_CODEWORDS - len(failed_indices),
+        codeword_failures=len(failed_indices),
+        corrected_symbols=0,
+        max_corrections_per_codeword=0,
+        correction_histogram=histogram,
+        failed_codeword_indices=tuple(failed_indices),
+        corrections_per_codeword=corrections,
+    )
 
 
 def test_transport_max_packet_and_validation():
@@ -131,12 +149,137 @@ def test_rs_over_limit_is_not_accepted():
     assert result.transport is None
 
 
+def test_rs_reports_failed_codeword_indices_without_expected_truth():
+    logical = wrap_packet(encode_symbol(b"abcdefgh", 0, 1, bytes(6400)), 4)
+    codewords = encode_logical(logical)
+    errors = np.arange(1, 13, dtype=np.uint8)
+    codewords[3, :12] ^= errors
+    codewords[17, :12] ^= errors
+    result = decode_rs_codewords(codewords)
+    assert result.logical is None
+    assert result.failed_codeword_indices == (3, 17)
+    assert result.corrections_per_codeword[3] is None
+    assert result.corrections_per_codeword[17] is None
+
+
 def test_fov_packet_crc_failure_is_dropped(tmp_path: Path):
     coordinator = PacketRecoveryCoordinator(tmp_path)
     damaged = bytearray(encode_symbol(b"abcdefgh", 0, 1, bytes(6400)))
     damaged[-1] ^= 1
     coordinator.feed(bytes(damaged), 0)
     assert coordinator.stats["packet_crc_failed"] == 1
+
+
+def test_packet_diagnostic_uses_coordinator_parse_result(tmp_path: Path):
+    data = b"descriptor"
+    metadata, file_id = _metadata("descriptor.bin", data)
+    coordinator = PacketRecoveryCoordinator(tmp_path)
+    meta = coordinator.feed(encode_meta(file_id, metadata), 0)
+    symbol = coordinator.feed(encode_symbol(file_id, 0, 0, bytes(6400)), 1)
+    assert PacketDiagnostic.from_packet(meta).to_dict() == {"type": "META"}
+    assert PacketDiagnostic.from_packet(symbol).to_dict() == {
+        "type": "SYMBOL",
+        "block_id": 0,
+        "symbol_id": 0,
+    }
+    assert "payload" not in PacketDiagnostic.from_packet(symbol).to_dict()
+    coordinator.cleanup()
+
+
+def test_single_failure_gets_unambiguous_neighbor_context_and_inference():
+    tracker = FailureTracker()
+    previous = PacketDiagnostic("SYMBOL", 5, 721)
+    following = PacketDiagnostic("SYMBOL", 5, 722)
+    tracker.observe_success(10, previous)
+    tracker.observe_failure(20, _failed_rs(3, 17))
+    tracker.observe_success(12, following)
+    summary = tracker.summary()
+    event = summary["events"][0]
+    assert event["observed_frame_index"] == 20
+    assert event["failed_codewords"] == 2
+    assert event["previous_successful"]["transport_index"] == 10
+    assert event["next_successful"]["transport_index"] == 12
+    assert event["inferred_transport_index"] == 11
+    assert event["inference_confident"] is True
+    assert event["neighbor_block_consistent"] is True
+    assert event["neighbor_block_id"] == 5
+    assert summary["longest_consecutive_burst"] == 1
+
+
+def test_two_consecutive_failures_are_one_burst_and_inferred_in_order():
+    tracker = FailureTracker()
+    tracker.observe_success(100, PacketDiagnostic("META"))
+    tracker.observe_failure(500, _failed_rs(3))
+    tracker.observe_failure(501, _failed_rs(4, 8))
+    tracker.observe_success(103, PacketDiagnostic("SYMBOL", 0, 1))
+    summary = tracker.summary()
+    assert [event["inferred_transport_index"] for event in summary["events"]] == [101, 102]
+    assert [event["failed_codewords"] for event in summary["events"]] == [1, 2]
+    assert summary["burst_count"] == 1
+    assert summary["longest_consecutive_burst"] == 2
+
+
+def test_transport_inference_is_rejected_when_gap_is_ambiguous():
+    tracker = FailureTracker()
+    tracker.observe_success(100, PacketDiagnostic("META"))
+    tracker.observe_failure(200, _failed_rs(3))
+    tracker.observe_success(105, PacketDiagnostic("SYMBOL", 0, 1))
+    event = tracker.summary()["events"][0]
+    assert event["inferred_transport_index"] is None
+    assert event["inference_confident"] is False
+
+
+def test_leading_failures_can_be_inferred_from_protocol_origin():
+    tracker = FailureTracker()
+    tracker.observe_failure(0, _failed_rs(3))
+    tracker.observe_failure(1, _failed_rs(4))
+    tracker.observe_success(2, PacketDiagnostic("META"))
+    events = tracker.summary()["events"]
+    assert [event["inferred_transport_index"] for event in events] == [0, 1]
+    assert all(event["inference_confident"] for event in events)
+
+
+def test_leading_inference_is_rejected_if_failure_does_not_start_at_observed_zero():
+    tracker = FailureTracker()
+    tracker.observe_failure(1, _failed_rs(3))
+    tracker.observe_success(1, PacketDiagnostic("META"))
+    event = tracker.summary()["events"][0]
+    assert event["inferred_transport_index"] is None
+    assert event["inference_confident"] is False
+
+
+def test_trailing_failure_is_not_inferred_without_next_transport():
+    tracker = FailureTracker()
+    tracker.observe_success(100, PacketDiagnostic("META"))
+    tracker.observe_failure(300, _failed_rs(7))
+    event = tracker.summary()["events"][0]
+    assert event["previous_successful"]["transport_index"] == 100
+    assert event["next_successful"] is None
+    assert event["inferred_transport_index"] is None
+    assert event["inference_confident"] is False
+
+
+def test_failure_burst_and_distance_summary():
+    tracker = FailureTracker()
+    for observed_index in (10, 11, 50, 100, 101, 102):
+        tracker.observe_failure(observed_index, _failed_rs(observed_index % RS_CODEWORDS))
+    summary = tracker.summary()
+    assert summary["inter_failure_distances"] == [1, 39, 50, 1, 1]
+    assert [burst["frame_count"] for burst in summary["consecutive_bursts"]] == [2, 1, 3]
+    assert summary["burst_count"] == 3
+    assert summary["longest_consecutive_burst"] == 3
+
+
+def test_failure_event_details_are_bounded_but_aggregates_are_complete():
+    tracker = FailureTracker(event_limit=2)
+    for observed_index in range(5):
+        tracker.observe_failure(observed_index, _failed_rs(3))
+    summary = tracker.summary()
+    assert summary["event_count_total"] == 5
+    assert summary["events_recorded"] == 2
+    assert summary["events_truncated"] is True
+    assert summary["failed_codewords_total"] == 5
+    assert summary["longest_consecutive_burst"] == 5
 
 
 @pytest.mark.parametrize(

@@ -30,4 +30,6 @@ python .\fvm_video2file.py OUTPUT.mp4 OUTPUT_DIR
 
 Encoder options are `--symbol-size 6400 --repair 0.10 --crf 15 --preset medium` by default. The decoder intentionally accepts only the video and output directory. It needs no manifest, original file, seed, or other sidecar. It writes `OUTPUT_DIR/.fvm/fvm_decode_results.json` with physical, transport, packet, RaptorQ, and final file diagnostics. The `.fvm/` directory is a reserved decoder-diagnostics namespace so diagnostic files cannot overwrite recovered user files. If an input filename is itself `.fvm`, the existing output collision policy selects a `recovered_...` filename.
 
+Production diagnostics record RS failure positions in observed-video-frame coordinates, failed codeword counts and indices, neighboring successful transport indices and packet descriptors, and consecutive failure bursts. A transport index is inferred only when bracketing successful indices make the mapping unambiguous. This inference is diagnostic only and is never used for file recovery.
+
 `FVM0_RS_PROBE` remains a separate channel experiment with expected truth and raw BER measurements. FVM FILE MODE is the real file transport and never uses probe truth.

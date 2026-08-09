@@ -170,6 +170,8 @@ class RSDecodeResult:
     corrected_symbols: int
     max_corrections_per_codeword: int
     correction_histogram: dict[int, int]
+    failed_codeword_indices: tuple[int, ...]
+    corrections_per_codeword: tuple[int | None, ...]
 
 
 def decode_rs_codewords(codewords: np.ndarray) -> RSDecodeResult:
@@ -177,17 +179,21 @@ def decode_rs_codewords(codewords: np.ndarray) -> RSDecodeResult:
         raise ValueError("codewords must have shape (28,255)")
     chunks: list[bytes] = []
     correction_counts: list[int] = []
-    failures = 0
-    for codeword in codewords:
+    corrections_per_codeword: list[int | None] = [None] * RS_CODEWORDS
+    failed_indices: list[int] = []
+    for codeword_index, codeword in enumerate(codewords):
         try:
             decoded, _, errata = _RS.decode(codeword.tobytes())
             decoded_bytes = bytes(decoded)
             if len(decoded_bytes) != RS_K:
                 raise ReedSolomonError("RS decoder returned an unexpected message length")
             chunks.append(decoded_bytes)
-            correction_counts.append(len(errata))
+            correction_count = len(errata)
+            correction_counts.append(correction_count)
+            corrections_per_codeword[codeword_index] = correction_count
         except ReedSolomonError:
-            failures += 1
+            failed_indices.append(codeword_index)
+    failures = len(failed_indices)
     histogram = {count: correction_counts.count(count) for count in range(9)}
     return RSDecodeResult(
         logical=b"".join(chunks) if not failures else None,
@@ -196,6 +202,8 @@ def decode_rs_codewords(codewords: np.ndarray) -> RSDecodeResult:
         corrected_symbols=sum(correction_counts),
         max_corrections_per_codeword=max(correction_counts, default=0),
         correction_histogram=histogram,
+        failed_codeword_indices=tuple(failed_indices),
+        corrections_per_codeword=tuple(corrections_per_codeword),
     )
 
 
