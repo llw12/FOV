@@ -160,21 +160,69 @@ class RSFrameRecovery:
     embedded_frame_index: int | None
 
 
-def decode_codewords(codewords: np.ndarray, expected: bytes, expected_frame_index: int) -> RSFrameRecovery:
-    chunks = []
-    successes = 0
-    corrections = 0
-    corrections_available = True
+@dataclass
+class RSDecodeResult:
+    """Production-safe RS result that does not depend on expected payload bytes."""
+
+    logical: bytes | None
+    codeword_successes: int
+    codeword_failures: int
+    corrected_symbols: int
+    max_corrections_per_codeword: int
+    correction_histogram: dict[int, int]
+
+
+def decode_rs_codewords(codewords: np.ndarray) -> RSDecodeResult:
+    if codewords.shape != (RS_CODEWORDS, RS_N):
+        raise ValueError("codewords must have shape (28,255)")
+    chunks: list[bytes] = []
+    correction_counts: list[int] = []
+    failures = 0
     for codeword in codewords:
         try:
             decoded, _, errata = _RS.decode(codeword.tobytes())
-            chunks.append(bytes(decoded)); successes += 1; corrections += len(errata)
+            decoded_bytes = bytes(decoded)
+            if len(decoded_bytes) != RS_K:
+                raise ReedSolomonError("RS decoder returned an unexpected message length")
+            chunks.append(decoded_bytes)
+            correction_counts.append(len(errata))
         except ReedSolomonError:
-            chunks.append(None)
-    failures = RS_CODEWORDS - successes
-    if failures: return RSFrameRecovery(None, successes, failures, corrections if corrections_available else None, False, False, False, None)
-    logical = b"".join(chunks)
+            failures += 1
+    histogram = {count: correction_counts.count(count) for count in range(9)}
+    return RSDecodeResult(
+        logical=b"".join(chunks) if not failures else None,
+        codeword_successes=RS_CODEWORDS - failures,
+        codeword_failures=failures,
+        corrected_symbols=sum(correction_counts),
+        max_corrections_per_codeword=max(correction_counts, default=0),
+        correction_histogram=histogram,
+    )
+
+
+def decode_codewords(codewords: np.ndarray, expected: bytes, expected_frame_index: int) -> RSFrameRecovery:
+    result = decode_rs_codewords(codewords)
+    if result.logical is None:
+        return RSFrameRecovery(
+            None,
+            result.codeword_successes,
+            result.codeword_failures,
+            result.corrected_symbols,
+            False,
+            False,
+            False,
+            None,
+        )
+    logical = result.logical
     embedded = int.from_bytes(logical[5:9], "big") if len(logical) >= HEADER_BYTES else None
     header = logical[:4] == MAGIC and logical[4:5] == bytes([VERSION]) and embedded == expected_frame_index
     crc = len(logical) == LOGICAL_BYTES and zlib.crc32(logical[:-4]) == int.from_bytes(logical[-4:], "big")
-    return RSFrameRecovery(logical, successes, failures, corrections, header, crc, logical == expected, embedded)
+    return RSFrameRecovery(
+        logical,
+        result.codeword_successes,
+        result.codeword_failures,
+        result.corrected_symbols,
+        header,
+        crc,
+        logical == expected,
+        embedded,
+    )

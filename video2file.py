@@ -147,8 +147,10 @@ class StreamingDecodeSession:
         state.received_unique += 1
         if packet.symbol_id < layout.source_symbols:
             state.received_source += 1
+            self.stats["source_symbols_received"] += 1
         else:
             state.received_repair += 1
+            self.stats["repair_symbols_received"] += 1
         if not state.decoder.add_symbol(packet.symbol_id, packet.payload):
             raise RuntimeError(f"RaptorQ native add_symbol failed: block_id={packet.block_id}, symbol_id={packet.symbol_id}")
         self.stats["valid_symbols"] += 1
