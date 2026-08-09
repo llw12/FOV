@@ -9,7 +9,7 @@ except ImportError:
 def analyze(directory:Path):
  records=list(csv.DictReader((directory/'fvm0_temporal_frames.csv').open(encoding='utf8')))
  for r in records:
-  for k in ('frame_index','block_index','phase','flip_count','bit_errors','zero_to_one','one_to_zero','changed_bit_errors','unchanged_bit_errors'): r[k]=int(r[k])
+  for k in ('frame_index','block_index','phase','flip_count','bit_errors','zero_to_one','one_to_zero','changed_bit_errors','unchanged_bit_errors'): r[k]=int(r[k] or 0)
   for k in ('is_anchor','is_warmup'): r[k]=r[k]=='True'
   r['transition_ratio']=None if not r['transition_ratio'] else float(r['transition_ratio'])
  results=json.loads((directory/'fvm0_temporal_results.json').read_text(encoding='utf8')); ratios=aggregate_ratios(records,results['matrix']['cells_per_frame'])
