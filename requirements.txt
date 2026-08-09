@@ -3,5 +3,6 @@ qrcode[pil]
 opencv-python
 zxing-cpp
 numpy
+matplotlib
 pytest
 yt-dlp
