@@ -18,9 +18,15 @@ class TemporalConfig:
     block_size: int = 150; warmup_blocks: int = 1; repeats: int = 5; seed: int = 20260809
     ratios: tuple[float, ...] = (.1, .2, .3, .4, .5)
     def __post_init__(self):
+        for value in (self.width, self.height, self.fps, self.cell_size, self.block_size, self.warmup_blocks, self.repeats, self.seed):
+            if not isinstance(value, int) or isinstance(value, bool): raise ValueError("configuration values must be integers")
+        if self.width <= 0 or self.height <= 0 or self.fps <= 0 or self.cell_size <= 0: raise ValueError("geometry and fps must be positive")
+        if not self.ratios or len(set(self.ratios)) != len(self.ratios): raise ValueError("ratios must be non-empty and unique")
         if self.width % self.cell_size or self.height % self.cell_size: raise ValueError("geometry must divide cell_size")
         if self.block_size < 2 or self.warmup_blocks < 0 or self.repeats < 1: raise ValueError("invalid block parameters")
-        for ratio in self.ratios: flip_count(self.cells_per_frame, ratio)
+        for ratio in self.ratios:
+            if not isinstance(ratio, (int, float)) or not math.isfinite(ratio): raise ValueError("ratio must be finite")
+            flip_count(self.cells_per_frame, ratio)
     @property
     def rows(self): return self.height // self.cell_size
     @property
@@ -52,6 +58,7 @@ class TemporalConfig:
             if item.get("block_index") != index or not allowed_ratio or item.get("flip_count") != flip_count(config.cells_per_frame, item["ratio"]):
                 raise ValueError("manifest schedule entry is invalid")
             if index < config.warmup_blocks and (not item.get("warmup") or item["ratio"] != .5): raise ValueError("invalid warmup schedule")
+            if index >= config.warmup_blocks and (item.get("warmup") is not False or item.get("repeat") != (index - config.warmup_blocks) // len(config.ratios)): raise ValueError("invalid experiment schedule")
         for repeat in range(config.repeats):
             chunk = schedule[config.warmup_blocks + repeat * len(config.ratios):config.warmup_blocks + (repeat + 1) * len(config.ratios)]
             if sorted(item.get("ratio") for item in chunk) != sorted(config.ratios): raise ValueError("schedule repeat is not balanced")
@@ -74,7 +81,7 @@ def temporal_frames(config: TemporalConfig, schedule: list[dict[str,Any]] | None
 
 def theoretical_bits(cells:int, flips:int)->float: return (math.lgamma(cells+1)-math.lgamma(flips+1)-math.lgamma(cells-flips+1))/math.log(2)
 
-def aggregate_ratios(records:list[dict[str,Any]], cells:int)->dict[str,Any]:
+def aggregate_ratios(records:list[dict[str,Any]], cells:int, fps:int=30, block_size:int=150)->dict[str,Any]:
     groups={}
     for r in records:
         if r["is_warmup"] or r["is_anchor"]: continue
@@ -84,6 +91,7 @@ def aggregate_ratios(records:list[dict[str,Any]], cells:int)->dict[str,Any]:
         rows = groups[ratio]
         sums=lambda k:sum(int(x[k]) for x in rows); errors=sums("bit_errors"); changed=sums("changed_bit_errors"); flip=int(rows[0]["flip_count"]); n=len(rows)
         values=sorted(int(x["bit_errors"]) for x in rows); unchanged=sums("unchanged_bit_errors"); p90=values[math.ceil(.9*n)-1]
-        bits=theoretical_bits(cells,flip); raw=bits*30
-        out[ratio]={"ratio":float(ratio),"flip_count":flip,"blocks":len(set(x["block_index"] for x in rows)),"transition_frames":n,"total_bits":n*cells,"bit_errors":errors,"correct_bits":n*cells-errors,"ber":errors/(n*cells),"changed_bits":n*flip,"changed_bit_errors":changed,"changed_ber":changed/(n*flip),"unchanged_bits":n*(cells-flip),"unchanged_bit_errors":unchanged,"unchanged_ber":unchanged/(n*(cells-flip)),"zero_to_one":sums("zero_to_one"),"one_to_zero":sums("one_to_zero"),"frames_with_errors":sum(v>0 for v in values),"fer":sum(v>0 for v in values)/n,"mean_bit_errors_per_frame":sum(values)/n,"median_bit_errors_per_frame":float(np.median(values)),"p90_bit_errors_per_frame":p90,"min_bit_errors_per_frame":values[0],"max_bit_errors_per_frame":values[-1],"mean_ber_per_frame":sum(values)/n/cells,"median_ber_per_frame":float(np.median(values))/cells,"theoretical_bits_per_transition_frame":bits,"theoretical_raw_bps":raw,"theoretical_raw_bytes_per_second":raw/8,"theoretical_effective_bps_including_anchor":raw*(149/150),"theoretical_effective_bytes_per_second_including_anchor":raw*(149/150)/8}
+        bits=theoretical_bits(cells,flip); raw=bits*fps
+        fraction=(block_size-1)/block_size
+        out[ratio]={"ratio":float(ratio),"flip_count":flip,"blocks":len(set(x["block_index"] for x in rows)),"transition_frames":n,"total_bits":n*cells,"bit_errors":errors,"correct_bits":n*cells-errors,"ber":errors/(n*cells),"changed_bits":n*flip,"changed_bit_errors":changed,"changed_ber":changed/(n*flip),"unchanged_bits":n*(cells-flip),"unchanged_bit_errors":unchanged,"unchanged_ber":unchanged/(n*(cells-flip)),"zero_to_one":sums("zero_to_one"),"one_to_zero":sums("one_to_zero"),"frames_with_errors":sum(v>0 for v in values),"fer":sum(v>0 for v in values)/n,"mean_bit_errors_per_frame":sum(values)/n,"median_bit_errors_per_frame":float(np.median(values)),"p90_bit_errors_per_frame":p90,"min_bit_errors_per_frame":values[0],"max_bit_errors_per_frame":values[-1],"mean_ber_per_frame":sum(values)/n/cells,"median_ber_per_frame":float(np.median(values))/cells,"theoretical_bits_per_transition_frame":bits,"theoretical_raw_bps":raw,"theoretical_raw_bytes_per_second":raw/8,"theoretical_effective_bps_including_anchor":raw*fraction,"theoretical_effective_bytes_per_second_including_anchor":raw*fraction/8}
     return out
