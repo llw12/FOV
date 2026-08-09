@@ -9,7 +9,7 @@ from typing import Any
 
 from file2video import estimate_packet_count, packet_stream, terminate_ffmpeg
 from fov import (INTERLEAVE_WINDOW, build_metadata, derive_block_layout, file_id_from_sha256,
-                 make_raptorq_engine, sha256_file)
+                 make_raptorq_engine, sha256_file, symbol_packet_size)
 from fvm_file_common import (FPS, HEIGHT, MAX_PACKET_BYTES, REPAIR_RATIO, SYMBOL_SIZE, WIDTH,
                              PHYSICAL_CONFIG, encode_transport_physical, physical_to_matrix)
 from scripts.fvm0_common import render_bits
@@ -29,6 +29,12 @@ def encode(
     original_size = input_path.stat().st_size
     if original_size <= 0:
         raise ValueError("empty files are not supported by pyraptorq")
+    max_symbol_packet_bytes = symbol_packet_size(symbol_size)
+    if max_symbol_packet_bytes > MAX_PACKET_BYTES:
+        raise ValueError(
+            f"FVM symbol_size {symbol_size} produces a {max_symbol_packet_bytes}-byte FOV SYMBOL packet, "
+            f"exceeding transport capacity {MAX_PACKET_BYTES} bytes"
+        )
     digest = sha256_file(input_path)
     metadata = build_metadata(input_path.name, original_size, digest, symbol_size, repair)
     layout = derive_block_layout(original_size, metadata["block_size"], symbol_size, repair)

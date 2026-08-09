@@ -6,13 +6,16 @@ import numpy as np
 import pytest
 
 from file2video import packet_stream
-from fov import (MetaPacket, SymbolPacket, build_metadata, encode_meta, encode_symbol,
-                 file_id_from_sha256, make_raptorq_engine, parse_packet, sha256_bytes)
+from fov import (SYMBOL_PACKET_OVERHEAD, MetaPacket, SymbolPacket, build_metadata, encode_meta,
+                 encode_symbol, file_id_from_sha256, make_raptorq_engine, parse_packet, sha256_bytes,
+                 symbol_packet_size)
+from fvm_file2video import encode as encode_video
 from fvm_file_common import (CODED_RS_BYTES, LOGICAL_BYTES, MAGIC, MAX_PACKET_BYTES, PHYSICAL_CONFIG,
                              VERSION, TRANSPORT_HEADER, TransportError, decode_transport_physical,
                              encode_transport_physical, matrix_to_physical, physical_to_matrix,
                              unwrap_packet, wrap_packet)
-from fvm_video2file import PacketRecoveryCoordinator, TransportIndexTracker
+from fvm_video2file import (PacketRecoveryCoordinator, TransportIndexTracker, _write_result,
+                            result_path)
 from scripts.fvm0_rs_common import deinterleave, interleave
 
 
@@ -72,6 +75,29 @@ def test_symbol_6400_fits_full_physical_round_trip():
     assert isinstance(parsed, SymbolPacket) and parsed.payload == payload
 
 
+def test_symbol_packet_size_is_derived_and_validated():
+    for payload_size in (1, 6400, 65535):
+        packet = encode_symbol(b"12345678", 0, 0, bytes(payload_size))
+        assert symbol_packet_size(payload_size) == len(packet) == payload_size + SYMBOL_PACKET_OVERHEAD
+    for payload_size in (0, -1, 65536, True, 1.5):
+        with pytest.raises(ValueError, match="payload size"):
+            symbol_packet_size(payload_size)
+
+
+def test_encoder_rejects_oversize_symbol_before_ffmpeg(tmp_path: Path, monkeypatch):
+    maximum = MAX_PACKET_BYTES - SYMBOL_PACKET_OVERHEAD
+    assert symbol_packet_size(maximum) == MAX_PACKET_BYTES
+    source = tmp_path / "input.bin"
+    source.write_bytes(b"fail-fast")
+
+    def unexpected_popen(*args, **kwargs):
+        pytest.fail("FFmpeg was started before FVM packet-capacity validation")
+
+    monkeypatch.setattr("fvm_file2video.subprocess.Popen", unexpected_popen)
+    with pytest.raises(ValueError, match=rf"symbol_size {maximum + 1}.*exceeding transport capacity"):
+        encode_video(source, tmp_path / "invalid.mp4", symbol_size=maximum + 1)
+
+
 def test_real_meta_packet_fits():
     data = b"meta-test" * 100
     metadata, file_id = _metadata("sample.bin", data)
@@ -113,13 +139,74 @@ def test_fov_packet_crc_failure_is_dropped(tmp_path: Path):
     assert coordinator.stats["packet_crc_failed"] == 1
 
 
-def test_transport_indices_are_diagnostic_and_accept_gap_duplicate_reorder():
+@pytest.mark.parametrize(
+    "indices,gaps,duplicates,out_of_order",
+    [
+        ([4, 5, 6], 4, 0, 0),
+        ([0, 2, 5], 3, 0, 0),
+        ([0, 1, 1, 3], 1, 1, 0),
+        ([3, 1, 2], 1, 0, 1),
+    ],
+)
+def test_transport_indices_are_diagnostic_and_accept_gap_duplicate_reorder(
+    indices, gaps, duplicates, out_of_order
+):
     tracker = TransportIndexTracker()
-    for frame_index in (0, 2, 1, 1, 5):
+    for frame_index in indices:
         tracker.observe(frame_index)
-    assert tracker.gaps == 2
-    assert tracker.duplicates == 1
-    assert tracker.out_of_order == 1
+    assert tracker.gaps == gaps
+    assert tracker.duplicates == duplicates
+    assert tracker.out_of_order == out_of_order
+
+
+def test_result_path_is_isolated_and_atomic(tmp_path: Path):
+    expected = tmp_path / ".fvm" / "fvm_decode_results.json"
+    assert result_path(tmp_path) == expected
+    _write_result(tmp_path, {"failure": "no valid META packet found"})
+    assert expected.read_text(encoding="utf-8")
+    assert not expected.with_name("fvm_decode_results.json.tmp").exists()
+    assert not (tmp_path / "fvm_decode_results.json").exists()
+
+
+def test_diagnostic_namespace_file_collision_fails_explicitly(tmp_path: Path):
+    (tmp_path / ".fvm").write_bytes(b"ordinary file")
+    with pytest.raises(OSError):
+        PacketRecoveryCoordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "filename,expected_recovered_name",
+    [
+        ("fvm_decode_results.json", "fvm_decode_results.json"),
+        (".fvm", "recovered_.fvm"),
+    ],
+)
+def test_recovered_filename_cannot_collide_with_diagnostics(
+    tmp_path: Path, filename: str, expected_recovered_name: str
+):
+    data = (b"user-payload-not-diagnostic-json\x00\xff" * 1024) + bytes(range(251))
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = source_dir / filename
+    source.write_bytes(data)
+    metadata, file_id = _metadata(filename, data)
+    output_dir = tmp_path / "decoded"
+    coordinator = PacketRecoveryCoordinator(output_dir)
+    packets = packet_stream(source, metadata, file_id, make_raptorq_engine())
+    for frame_index, packet in enumerate(packets):
+        physical = encode_transport_physical(packet, frame_index)
+        decoded = decode_transport_physical(physical)
+        assert decoded.transport is not None
+        coordinator.feed(decoded.transport.packet, decoded.transport.frame_index)
+    recovered = coordinator.finalize()
+    assert recovered.name == expected_recovered_name
+    assert recovered.read_bytes() == data
+    assert hashlib.sha256(recovered.read_bytes()).hexdigest() == metadata["sha256"]
+    diagnostic = result_path(output_dir)
+    _write_result(output_dir, {"file": {"exact": True}})
+    assert diagnostic.exists()
+    assert diagnostic != recovered
+    assert recovered.read_bytes() == data
 
 
 def test_memory_file_roundtrip_with_erasure_late_meta_reorder_and_duplicate(tmp_path: Path):

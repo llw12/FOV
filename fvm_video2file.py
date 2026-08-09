@@ -17,6 +17,7 @@ from fvm_file_common import (FPS, HEIGHT, PHYSICAL_CONFIG, WIDTH, decode_transpo
 from scripts.fvm0_common import decode_frame
 from video2file import PreMetaBuffer, StreamingDecodeSession, _validate_meta
 
+DIAGNOSTIC_DIRNAME = ".fvm"
 RESULT_FILENAME = "fvm_decode_results.json"
 
 
@@ -38,8 +39,13 @@ class TransportIndexTracker:
 
     @property
     def gaps(self) -> int:
+        """Count observable leading and internal gaps; trailing loss is unknowable."""
         ordered = sorted(self.seen)
-        return sum(current - previous - 1 for previous, current in zip(ordered, ordered[1:]))
+        if not ordered:
+            return 0
+        return ordered[0] + sum(
+            current - previous - 1 for previous, current in zip(ordered, ordered[1:])
+        )
 
 
 class PacketRecoveryCoordinator:
@@ -47,6 +53,7 @@ class PacketRecoveryCoordinator:
 
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = output_dir
+        diagnostic_dir(output_dir).mkdir(parents=True, exist_ok=True)
         self.premeta = PreMetaBuffer()
         self.session: StreamingDecodeSession | None = None
         self.stats: Counter[str] = Counter()
@@ -141,9 +148,23 @@ def _base_result(video_path: Path, width: int, height: int, fps: float) -> dict[
     }
 
 
+def diagnostic_dir(output_dir: Path) -> Path:
+    return output_dir / DIAGNOSTIC_DIRNAME
+
+
+def result_path(output_dir: Path) -> Path:
+    return diagnostic_dir(output_dir) / RESULT_FILENAME
+
+
 def _write_result(output_dir: Path, result: dict[str, Any]) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / RESULT_FILENAME).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    path = result_path(output_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    try:
+        temporary.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _record_index_diagnostics(result: dict[str, Any], indices: TransportIndexTracker) -> None:

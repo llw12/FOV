@@ -36,6 +36,7 @@ META_INTERVAL = 300
 _META_HEADER = struct.Struct(">4sB8sH")
 _SYMBOL_HEADER = struct.Struct(">4sB8sHIH")
 _CRC = struct.Struct(">I")
+SYMBOL_PACKET_OVERHEAD = _SYMBOL_HEADER.size + _CRC.size
 _DLL_DIRECTORY_HANDLES: list[Any] = []
 
 
@@ -192,6 +193,13 @@ def encode_symbol(file_id: bytes, block_id: int, symbol_id: int, payload: bytes)
         raise ValueError("symbol payload must contain 1..65535 bytes")
     body = _SYMBOL_HEADER.pack(MAGIC, TYPE_SYMBOL, file_id, block_id, symbol_id, len(payload)) + payload
     return body + _CRC.pack(zlib.crc32(body) & 0xFFFFFFFF)
+
+
+def symbol_packet_size(payload_size: int) -> int:
+    """Return the encoded FOV1 SYMBOL packet size for a valid payload length."""
+    if not _is_int(payload_size) or not 1 <= payload_size <= 0xFFFF:
+        raise ValueError("symbol payload size must be an integer between 1 and 65535")
+    return SYMBOL_PACKET_OVERHEAD + payload_size
 
 
 def parse_packet(packet: bytes) -> MetaPacket | SymbolPacket:
