@@ -36,6 +36,25 @@ class TemporalConfig:
         return result
     def manifest(self):
         return {"format":FORMAT,"prng":PRNG,"width":self.width,"height":self.height,"fps":self.fps,"cell_size":self.cell_size,"rows":self.rows,"cols":self.cols,"cells_per_frame":self.cells_per_frame,"block_size":self.block_size,"warmup_blocks":self.warmup_blocks,"repeats":self.repeats,"ratios":list(self.ratios),"seed":self.seed,"schedule":self.schedule()}
+    @classmethod
+    def from_manifest(cls, manifest: dict[str, Any]) -> "TemporalConfig":
+        required = {"format", "prng", "width", "height", "fps", "cell_size", "rows", "cols", "cells_per_frame", "block_size", "warmup_blocks", "repeats", "ratios", "seed", "schedule"}
+        if not isinstance(manifest, dict) or not required <= manifest.keys() or manifest["format"] != FORMAT or manifest["prng"] != PRNG:
+            raise ValueError("unsupported or incomplete FVM0-T manifest")
+        config = cls(**{key: manifest[key] for key in ("width", "height", "fps", "cell_size", "block_size", "warmup_blocks", "repeats", "seed")}, ratios=tuple(manifest["ratios"]))
+        if (manifest["rows"], manifest["cols"], manifest["cells_per_frame"]) != (config.rows, config.cols, config.cells_per_frame):
+            raise ValueError("manifest geometry does not match parameters")
+        schedule = manifest["schedule"]
+        if not isinstance(schedule, list) or len(schedule) != config.warmup_blocks + config.repeats * len(config.ratios):
+            raise ValueError("manifest schedule has invalid length")
+        for index, item in enumerate(schedule):
+            if item.get("block_index") != index or item.get("ratio") not in config.ratios or item.get("flip_count") != flip_count(config.cells_per_frame, item["ratio"]):
+                raise ValueError("manifest schedule entry is invalid")
+            if index < config.warmup_blocks and (not item.get("warmup") or item["ratio"] != .5): raise ValueError("invalid warmup schedule")
+        for repeat in range(config.repeats):
+            chunk = schedule[config.warmup_blocks + repeat * len(config.ratios):config.warmup_blocks + (repeat + 1) * len(config.ratios)]
+            if sorted(item.get("ratio") for item in chunk) != sorted(config.ratios): raise ValueError("schedule repeat is not balanced")
+        return config
 
 def temporal_frames(config: TemporalConfig, schedule: list[dict[str,Any]] | None=None) -> Iterator[tuple[dict[str,Any],np.ndarray,np.ndarray|None]]:
     schedule=schedule or config.schedule(); absolute=np.random.Generator(np.random.PCG64(config.seed+1)); masks=np.random.Generator(np.random.PCG64(config.seed+2))
@@ -60,7 +79,10 @@ def aggregate_ratios(records:list[dict[str,Any]], cells:int)->dict[str,Any]:
         if r["is_warmup"] or r["is_anchor"]: continue
         groups.setdefault(str(r["transition_ratio"]),[]).append(r)
     out={}
-    for ratio, rows in groups.items():
+    for ratio in sorted(groups, key=float):
+        rows = groups[ratio]
         sums=lambda k:sum(int(x[k]) for x in rows); errors=sums("bit_errors"); changed=sums("changed_bit_errors"); flip=int(rows[0]["flip_count"]); n=len(rows)
-        out[ratio]={"ratio":float(ratio),"flip_count":flip,"blocks":len(set(x["block_index"] for x in rows)),"transition_frames":n,"total_bits":n*cells,"bit_errors":errors,"ber":errors/(n*cells),"changed_bits":n*flip,"changed_bit_errors":changed,"changed_ber":changed/(n*flip),"unchanged_bits":n*(cells-flip),"unchanged_bit_errors":sums("unchanged_bit_errors"),"unchanged_ber":sums("unchanged_bit_errors")/(n*(cells-flip)),"zero_to_one":sums("zero_to_one"),"one_to_zero":sums("one_to_zero"),"theoretical_bits_per_transition_frame":theoretical_bits(cells,flip)}
+        values=sorted(int(x["bit_errors"]) for x in rows); unchanged=sums("unchanged_bit_errors"); p90=values[math.ceil(.9*n)-1]
+        bits=theoretical_bits(cells,flip); raw=bits*30
+        out[ratio]={"ratio":float(ratio),"flip_count":flip,"blocks":len(set(x["block_index"] for x in rows)),"transition_frames":n,"total_bits":n*cells,"bit_errors":errors,"correct_bits":n*cells-errors,"ber":errors/(n*cells),"changed_bits":n*flip,"changed_bit_errors":changed,"changed_ber":changed/(n*flip),"unchanged_bits":n*(cells-flip),"unchanged_bit_errors":unchanged,"unchanged_ber":unchanged/(n*(cells-flip)),"zero_to_one":sums("zero_to_one"),"one_to_zero":sums("one_to_zero"),"frames_with_errors":sum(v>0 for v in values),"fer":sum(v>0 for v in values)/n,"mean_bit_errors_per_frame":sum(values)/n,"median_bit_errors_per_frame":float(np.median(values)),"p90_bit_errors_per_frame":p90,"min_bit_errors_per_frame":values[0],"max_bit_errors_per_frame":values[-1],"mean_ber_per_frame":sum(values)/n/cells,"median_ber_per_frame":float(np.median(values))/cells,"theoretical_bits_per_transition_frame":bits,"theoretical_raw_bps":raw,"theoretical_raw_bytes_per_second":raw/8,"theoretical_effective_bps_including_anchor":raw*(149/150),"theoretical_effective_bytes_per_second_including_anchor":raw*(149/150)/8}
     return out
