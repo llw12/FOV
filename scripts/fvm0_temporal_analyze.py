@@ -2,7 +2,10 @@ from __future__ import annotations
 import argparse,csv,json
 from pathlib import Path
 import matplotlib.pyplot as plt
-from scripts.fvm0_temporal_common import aggregate_ratios
+try:
+ from fvm0_temporal_common import aggregate_ratios
+except ImportError:
+ from scripts.fvm0_temporal_common import aggregate_ratios
 def analyze(directory:Path):
  records=list(csv.DictReader((directory/'fvm0_temporal_frames.csv').open(encoding='utf8')))
  for r in records:

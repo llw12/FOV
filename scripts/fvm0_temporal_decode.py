@@ -2,8 +2,12 @@ from __future__ import annotations
 import argparse,csv,json
 from pathlib import Path
 import cv2
-from scripts.fvm0_common import decode_frame
-from scripts.fvm0_temporal_common import TemporalConfig,temporal_frames,aggregate_ratios
+try:
+ from fvm0_common import decode_frame
+ from fvm0_temporal_common import TemporalConfig,temporal_frames,aggregate_ratios
+except ImportError:
+ from scripts.fvm0_common import decode_frame
+ from scripts.fvm0_temporal_common import TemporalConfig,temporal_frames,aggregate_ratios
 def decode(video:Path, manifest_path:Path, output:Path):
  m=json.loads(manifest_path.read_text(encoding='utf8')); c=TemporalConfig(width=m['width'],height=m['height'],fps=m['fps'],cell_size=m['cell_size'],block_size=m['block_size'],warmup_blocks=m['warmup_blocks'],repeats=m['repeats'],seed=m['seed'],ratios=tuple(m['ratios']))
  cap=cv2.VideoCapture(str(video)); output.mkdir(parents=True,exist_ok=True); records=[]
