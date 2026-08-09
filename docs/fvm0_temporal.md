@@ -9,3 +9,11 @@ python scripts/fvm0_temporal_analyze.py runs/fvm0-t-local
 ```
 
 The 50% condition is a transition-density control, not equivalent to FVM0_RAW. A 150-frame block is an experiment setting, not a permanent platform GOP claim. Upload manually using an existing workflow; this tool never uploads to Bilibili or carries real payload coding.
+
+The default probe is 1920x1080 at 30 FPS with 5px cells (384x216 = 82,944 cells), ratios 10/20/30/40/50%, one warm-up block, and five balanced shuffled repeats: 3,900 frames total. Each block begins with an independent anchor. Ratio BER excludes warm-up and anchor frames; changed and unchanged BER use their respective total bit denominators. Luminance p1/p99 is a distribution diagnostic. Packet size and ffprobe-confirmed keyframe metadata are correlation diagnostics only. The constant-weight rate is `log2(C(N,m))` adjusted by FPS and `(block_size-1)/block_size`; it excludes headers, sync, CRC, FEC, metadata, and rank/unrank implementation.
+
+Before manual platform upload, run local decode and analysis and require all main-ratio observed BER values to be zero. Disable platform watermarks, wait for the 1920x1080 rendition, download that rendition, decode it, then run:
+
+```powershell
+python .\scripts\fvm0_temporal_analyze.py RESULT_DIR --ffprobe-video PLATFORM_1080P.mp4
+```
