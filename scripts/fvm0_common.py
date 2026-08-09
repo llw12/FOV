@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, asdict
 from typing import Any, Iterator
+from collections import defaultdict
+from statistics import median
 
 import cv2
 import numpy as np
@@ -228,3 +230,33 @@ def top_error_cells(error_map: np.ndarray, frame_count: int, limit: int = 20) ->
         row, col = np.unravel_index(index, error_map.shape)
         cells.append({"row": int(row), "col": int(col), "error_count": count, "error_rate": count / frame_count})
     return cells
+
+
+def aggregate_gop_phase(frame_records: Iterator[dict[str, Any]] | list[dict[str, Any]], bits_per_frame: int, gop_size: int) -> dict[str, Any]:
+    """Aggregate decoder frame records by diagnostic modulo period, not keyframe type."""
+    if gop_size <= 0 or bits_per_frame <= 0:
+        raise ValueError("gop_size and bits_per_frame must be positive")
+    buckets = [defaultdict(int) for _ in range(gop_size)]
+    errors = [[] for _ in range(gop_size)]
+    for record in frame_records:
+        phase = int(record["frame_index"]) % gop_size
+        bucket = buckets[phase]
+        value = int(record["bit_errors"])
+        bucket["frame_count"] += 1; bucket["bit_errors"] += value
+        bucket["zero_to_one"] += int(record["zero_to_one"]); bucket["one_to_zero"] += int(record["one_to_zero"])
+        bucket["frames_with_errors"] += int(value > 0); errors[phase].append(value)
+    phases = []
+    for phase, bucket in enumerate(buckets):
+        count = bucket["frame_count"]; values = errors[phase]; total_bits = count * bits_per_frame
+        phases.append({"phase": phase, "frame_count": count, "total_bits": total_bits,
+                       "bit_errors": bucket["bit_errors"], "ber": bucket["bit_errors"] / total_bits if total_bits else None,
+                       "frames_with_errors": bucket["frames_with_errors"], "fer": bucket["frames_with_errors"] / count if count else None,
+                       "zero_to_one": bucket["zero_to_one"], "one_to_zero": bucket["one_to_zero"],
+                       "mean_bit_errors_per_frame": sum(values) / count if count else None,
+                       "min_bit_errors_per_frame": min(values) if values else None,
+                       "max_bit_errors_per_frame": max(values) if values else None,
+                       "median_bit_errors_per_frame": median(values) if values else None})
+    ranked = [entry for entry in phases if entry["ber"] is not None]
+    return {"gop_size": gop_size, "phase_count": gop_size, "phases": phases,
+            "best_phase_by_ber": min(ranked, key=lambda entry: entry["ber"])["phase"] if ranked else None,
+            "worst_phase_by_ber": max(ranked, key=lambda entry: entry["ber"])["phase"] if ranked else None}

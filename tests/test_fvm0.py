@@ -3,9 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import io
+import csv
+import json
 
 from scripts.fvm0_common import LEGACY_PRNG, FVM0Config, Measurements, bit_matrices, decode_frame, render_bits
 from scripts.fvm0_encode import encode
+from scripts.fvm0_common import aggregate_gop_phase
+from scripts.fvm0_gop_analyze import write_analysis
 
 
 def test_default_geometry() -> None:
@@ -72,6 +76,20 @@ def test_encoder_creates_output_parents_before_launch(tmp_path, monkeypatch) -> 
     monkeypatch.setattr("scripts.fvm0_encode.subprocess.Popen", fake_popen)
     config = FVM0Config(width=4, height=2, cell_size=2, frames=1, seed=1)
     encode(tmp_path / "nested" / "video.mp4", config, 15, "medium", tmp_path / "nested" / "video.manifest.json")
+
+
+def test_gop_phase_aggregation_and_standalone_analyzer(tmp_path) -> None:
+    records = [{"frame_index": i, "bit_errors": value, "zero_to_one": value - 1 if value else 0, "one_to_zero": 1 if value else 0, "ber": 0} for i, value in enumerate([10, 1, 0, 20, 2, 3, 4, 5, 6, 7])]
+    analysis = aggregate_gop_phase(records, 100, 3)
+    phase0 = analysis["phases"][0]
+    assert (phase0["frame_count"], phase0["total_bits"], phase0["bit_errors"], phase0["ber"], phase0["fer"]) == (4, 400, 41, 0.1025, 1.0)
+    assert (phase0["min_bit_errors_per_frame"], phase0["max_bit_errors_per_frame"], phase0["median_bit_errors_per_frame"]) == (4, 20, 8.5)
+    with pytest.raises(ValueError): aggregate_gop_phase([], 100, 0)
+    with (tmp_path / "fvm0_frames.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=records[0]); writer.writeheader(); writer.writerows(records)
+    (tmp_path / "fvm0_results.json").write_text(json.dumps({"matrix": {"bits_per_frame": 100}}), encoding="utf-8")
+    assert write_analysis(tmp_path, 4)["phases"][0]["frame_count"] == 3
+    assert all((tmp_path / name).exists() for name in ("fvm0_gop_phase.csv", "fvm0_gop_phase.json", "fvm0_gop_phase_ber.png"))
 
 
 def test_frame_rendering_and_direct_decode_are_bit_exact() -> None:

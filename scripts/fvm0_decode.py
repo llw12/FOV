@@ -43,7 +43,9 @@ def render_luma_histogram(measurements: Measurements, output: Path) -> None:
     plt.close(figure)
 
 
-def decode(video_path: Path, manifest_path: Path, output_dir: Path) -> dict:
+def decode(video_path: Path, manifest_path: Path, output_dir: Path, gop_size: int | None = None) -> dict:
+    if gop_size is not None and gop_size <= 0:
+        raise ValueError("gop_size must be positive")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     config = FVM0Config.from_manifest(manifest)
     capture = cv2.VideoCapture(str(video_path))
@@ -91,6 +93,17 @@ def decode(video_path: Path, manifest_path: Path, output_dir: Path) -> dict:
     result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     render_heatmap(measurements.spatial_errors, output_dir / "fvm0_error_heatmap.png")
     render_luma_histogram(measurements, output_dir / "fvm0_luma_histogram.png")
+    if gop_size is not None:
+        try:
+            from fvm0_gop_analyze import write_analysis
+        except ImportError:
+            from scripts.fvm0_gop_analyze import write_analysis
+        analysis = write_analysis(output_dir, gop_size)
+        best, worst = analysis["best_phase_by_ber"], analysis["worst_phase_by_ber"]
+        result["gop_phase_analysis"] = {"gop_size": gop_size, "best_phase": best,
+            "best_phase_ber": analysis["phases"][best]["ber"], "worst_phase": worst,
+            "worst_phase_ber": analysis["phases"][worst]["ber"]}
+        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     bits = result["bits"]
     frames = result["frames"]
     print(f"\nExpected video: {config.width}x{config.height}, {config.fps:.3f} fps\nActual video: {actual_width}x{actual_height}, {actual_fps:.3f} fps\nExpected frames: {config.frames}\nActual frames: {actual_frames}\nCompared frames: {measurements.compared_frames}")
@@ -106,6 +119,9 @@ def decode(video_path: Path, manifest_path: Path, output_dir: Path) -> dict:
         print(f"Top error cells: {result['top_error_cells']}")
     for warning in warnings:
         print(f"WARNING: {warning}")
+    if gop_size is not None:
+        print(f"GOP phase analysis: assumed period {gop_size}; best phase {best} BER {analysis['phases'][best]['ber']}; worst phase {worst} BER {analysis['phases'][worst]['ber']}")
+        print("IMPORTANT: modulo-GOP analysis is diagnostic only; phase 0 is not proven to be an I-frame.")
     print(f"Results: {result_path}")
     return result
 
@@ -115,8 +131,9 @@ def main() -> None:
     parser.add_argument("video", type=Path)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("fvm0-result"))
+    parser.add_argument("--gop-size", type=int)
     args = parser.parse_args()
-    decode(args.video, args.manifest, args.output_dir)
+    decode(args.video, args.manifest, args.output_dir, args.gop_size)
 
 
 if __name__ == "__main__":

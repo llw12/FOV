@@ -38,3 +38,18 @@ FVM0 没有 frame ID；若实际帧数与 manifest 不同，脚本只比较共�
 5. 比较本地与平台的 BER、FER、错误 burst、空间热图和亮度分布。
 
 FVM0 不自动化批量上传，也不处理平台风控或限制规避。
+## GOP phase diagnostics
+
+Use an explicitly supplied diagnostic period to inspect BER by `frame_index % gop_size` during decoding:
+
+```powershell
+python scripts/fvm0_decode.py VIDEO.mp4 MANIFEST.json --output-dir RESULT --gop-size 150
+```
+
+Existing decode results can be re-analysed without decoding the MP4 again:
+
+```powershell
+python scripts/fvm0_gop_analyze.py runs/fvm0-5px-1200-bilibili-noLogo --gop-size 150
+```
+
+This produces `fvm0_gop_phase.csv`, `fvm0_gop_phase.json`, and `fvm0_gop_phase_ber.png`. The period is an experimental diagnostic assumption, not an FVM protocol constant or proof of the video GOP size. In particular, a low phase-0 BER does not establish that phase 0 is an I-frame; use `ffprobe` frame metadata to verify keyframes.
