@@ -145,6 +145,55 @@ def theoretical_bits(cells: int, flips: int) -> float:
     return (math.lgamma(cells + 1) - math.lgamma(flips + 1) - math.lgamma(cells - flips + 1)) / math.log(2)
 
 
+TRANSITION_FIELDS = (
+    "expected_transition_cells", "observed_transition_cells", "transition_true_positive",
+    "transition_missed", "transition_false_positive", "transition_true_negative",
+    "transition_mask_errors", "transition_mask_ber", "transition_recall",
+    "transition_precision", "transition_f1", "missed_flip_rate", "false_flip_rate",
+    "expected_zero_to_one_transitions", "correct_zero_to_one_transitions",
+    "opposite_zero_to_one_transitions", "missed_zero_to_one_transitions",
+    "expected_one_to_zero_transitions", "correct_one_to_zero_transitions",
+    "opposite_one_to_zero_transitions", "missed_one_to_zero_transitions",
+    "zero_to_one_direction_recall", "one_to_zero_direction_recall",
+    "transition_direction_accuracy",
+)
+
+
+def _ratio(numerator: int, denominator: int) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def measure_transition(expected_previous: np.ndarray, expected_current: np.ndarray,
+                       actual_previous: np.ndarray, actual_current: np.ndarray) -> dict[str, Any]:
+    """Measure transition-mask and direction recovery between adjacent frames."""
+    shapes = {array.shape for array in (expected_previous, expected_current, actual_previous, actual_current)}
+    if len(shapes) != 1:
+        raise ValueError("transition arrays must have identical shapes")
+    expected = expected_previous != expected_current
+    observed = actual_previous != actual_current
+    tp = int((expected & observed).sum()); fn = int((expected & ~observed).sum())
+    fp = int((~expected & observed).sum()); tn = int((~expected & ~observed).sum())
+    expected_01 = expected & (expected_previous == 0); expected_10 = expected & (expected_previous == 1)
+    actual_01 = observed & (actual_previous == 0); actual_10 = observed & (actual_previous == 1)
+    e01=int(expected_01.sum()); e10=int(expected_10.sum())
+    c01=int((expected_01 & actual_01).sum()); o01=int((expected_01 & actual_10).sum())
+    c10=int((expected_10 & actual_10).sum()); o10=int((expected_10 & actual_01).sum())
+    precision=_ratio(tp,tp+fp); recall=_ratio(tp,tp+fn)
+    f1=None if precision is None or recall is None or precision+recall==0 else 2*precision*recall/(precision+recall)
+    return {"expected_transition_cells":tp+fn,"observed_transition_cells":tp+fp,
+            "transition_true_positive":tp,"transition_missed":fn,"transition_false_positive":fp,
+            "transition_true_negative":tn,"transition_mask_errors":fn+fp,
+            "transition_mask_ber":(fn+fp)/expected.size,"transition_recall":recall,
+            "transition_precision":precision,"transition_f1":f1,"missed_flip_rate":_ratio(fn,tp+fn),
+            "false_flip_rate":_ratio(fp,fp+tn),"expected_zero_to_one_transitions":e01,
+            "correct_zero_to_one_transitions":c01,"opposite_zero_to_one_transitions":o01,
+            "missed_zero_to_one_transitions":e01-c01-o01,"expected_one_to_zero_transitions":e10,
+            "correct_one_to_zero_transitions":c10,"opposite_one_to_zero_transitions":o10,
+            "missed_one_to_zero_transitions":e10-c10-o10,
+            "zero_to_one_direction_recall":_ratio(c01,e01),"one_to_zero_direction_recall":_ratio(c10,e10),
+            "transition_direction_accuracy":_ratio(c01+c10,e01+e10)}
+
+
 def aggregate_ratios(records: list[dict[str, Any]], cells: int, fps: int, block_size: int) -> dict[str, Any]:
     """Aggregate non-warmup transition records using weighted bit denominators."""
     groups: dict[float, list[dict[str, Any]]] = {}
@@ -177,4 +226,24 @@ def aggregate_ratios(records: list[dict[str, Any]], cells: int, fps: int, block_
             "theoretical_raw_bytes_per_second": raw_bps/8,
             "theoretical_effective_bps_including_anchor": raw_bps*(block_size-1)/block_size,
             "theoretical_effective_bytes_per_second_including_anchor": raw_bps*(block_size-1)/block_size/8}
+        result=output[str(ratio)]
+        for field in ("expected_transition_cells","observed_transition_cells","transition_true_positive",
+                      "transition_missed","transition_false_positive","transition_true_negative",
+                      "transition_mask_errors","expected_zero_to_one_transitions",
+                      "correct_zero_to_one_transitions","opposite_zero_to_one_transitions",
+                      "missed_zero_to_one_transitions","expected_one_to_zero_transitions",
+                      "correct_one_to_zero_transitions","opposite_one_to_zero_transitions",
+                      "missed_one_to_zero_transitions"):
+            result[field]=sum(int(row[field]) for row in rows)
+        tp=result["transition_true_positive"]; fn=result["transition_missed"]; fp=result["transition_false_positive"]; tn=result["transition_true_negative"]
+        result.update(transition_total_cells=count*cells,transition_mask_ber=(fn+fp)/(count*cells),
+                      transition_recall=_ratio(tp,tp+fn),transition_precision=_ratio(tp,tp+fp),
+                      missed_flip_rate=_ratio(fn,tp+fn),false_flip_rate=_ratio(fp,fp+tn),
+                      transition_count_bias=(result["observed_transition_cells"]-result["expected_transition_cells"])/result["expected_transition_cells"],
+                      mean_observed_transition_cells_per_frame=result["observed_transition_cells"]/count)
+        precision=result["transition_precision"]; recall=result["transition_recall"]
+        result["transition_f1"]=None if precision is None or recall is None or precision+recall==0 else 2*precision*recall/(precision+recall)
+        result["zero_to_one_direction_recall"]=_ratio(result["correct_zero_to_one_transitions"],result["expected_zero_to_one_transitions"])
+        result["one_to_zero_direction_recall"]=_ratio(result["correct_one_to_zero_transitions"],result["expected_one_to_zero_transitions"])
+        result["transition_direction_accuracy"]=_ratio(result["correct_zero_to_one_transitions"]+result["correct_one_to_zero_transitions"],result["expected_transition_cells"])
     return output

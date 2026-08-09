@@ -14,9 +14,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 try:
-    from fvm0_temporal_common import aggregate_ratios
+    from fvm0_temporal_common import TRANSITION_FIELDS, aggregate_ratios
 except ImportError:
-    from scripts.fvm0_temporal_common import aggregate_ratios
+    from scripts.fvm0_temporal_common import TRANSITION_FIELDS, aggregate_ratios
 
 REQUIRED_COLUMNS = {"frame_index", "block_index", "phase", "is_anchor", "is_warmup",
                     "transition_ratio", "flip_count", "bit_errors", "ber", "zero_to_one",
@@ -27,6 +27,8 @@ def load_records(path: Path) -> list[dict[str, Any]]:
     if not path.exists(): raise RuntimeError(f"missing frames CSV: {path}")
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
+        if reader.fieldnames and not set(TRANSITION_FIELDS) <= set(reader.fieldnames):
+            raise RuntimeError("transition-mask metrics are unavailable; re-run fvm0_temporal_decode with the updated decoder")
         if not reader.fieldnames or not REQUIRED_COLUMNS <= set(reader.fieldnames):
             raise RuntimeError("frames CSV is empty or missing required columns")
         rows = list(reader)
@@ -34,6 +36,9 @@ def load_records(path: Path) -> list[dict[str, Any]]:
     for row in rows:
         for key in ("frame_index", "block_index", "phase", "flip_count", "bit_errors", "zero_to_one", "one_to_zero", "changed_bit_errors", "unchanged_bit_errors"):
             row[key] = int(row[key] or 0)
+        for key in TRANSITION_FIELDS:
+            if key not in ("transition_mask_ber","transition_recall","transition_precision","transition_f1","missed_flip_rate","false_flip_rate","zero_to_one_direction_recall","one_to_zero_direction_recall","transition_direction_accuracy"):
+                row[key]=int(row[key] or 0)
         for key in ("is_anchor", "is_warmup"): row[key] = row[key] == "True"
         row["transition_ratio"] = float(row["transition_ratio"]) if row["transition_ratio"] else None
         row["ber"] = float(row["ber"])
@@ -64,6 +69,13 @@ def _plot_basic(directory: Path, ratios: dict[str, Any], luminance: dict[str, An
         fig, ax = plt.subplots(); ax.plot(x, first, marker="o", label="primary")
         if second is not None: ax.plot(x, second, marker="o", label="secondary"); ax.legend()
         ax.set(xlabel="transition ratio (%)", ylabel=ylabel, title=title); fig.tight_layout(); fig.savefig(directory/name); plt.close(fig)
+    transition_figures=[
+        ("fvm0_temporal_transition_mask_ber_vs_ratio.png",[e["ber"] for e in entries],[e["transition_mask_ber"] for e in entries],"absolute BER","transition-mask BER"),
+        ("fvm0_temporal_transition_error_types_vs_ratio.png",[e["missed_flip_rate"] for e in entries],[e["false_flip_rate"] for e in entries],"missed flip rate","false flip rate"),
+        ("fvm0_temporal_transition_precision_recall.png",[e["transition_precision"] for e in entries],[e["transition_recall"] for e in entries],"precision","recall"),
+        ("fvm0_temporal_transition_direction.png",[e["zero_to_one_direction_recall"] for e in entries],[e["one_to_zero_direction_recall"] for e in entries],"0->1 direction recall","1->0 direction recall")]
+    for name,first,second,label1,label2 in transition_figures:
+        fig,ax=plt.subplots();ax.plot(x,first,marker="o",label=label1);ax.plot(x,second,marker="o",label=label2);ax.set(xlabel="transition ratio (%)",ylabel="rate");ax.legend();fig.tight_layout();fig.savefig(directory/name);plt.close(fig)
     if luminance:
         zero = [luminance[str(e["ratio"])]["expected_zero"]["p99"] for e in entries]
         one = [luminance[str(e["ratio"])]["expected_one"]["p1"] for e in entries]
@@ -121,6 +133,9 @@ def analyze(directory: Path, ffprobe_video: Path | None = None) -> dict[str, Any
 
 
 def main() -> None:
-    parser=argparse.ArgumentParser(); parser.add_argument("result_dir",type=Path); parser.add_argument("--ffprobe-video",type=Path); args=parser.parse_args(); analyze(args.result_dir,args.ffprobe_video)
+    parser=argparse.ArgumentParser(); parser.add_argument("result_dir",type=Path); parser.add_argument("--ffprobe-video",type=Path); args=parser.parse_args(); results=analyze(args.result_dir,args.ffprobe_video)
+    def display(value): return "null" if value is None else f"{value:.6g}"
+    for entry in results["ratios"].values():
+        print(f"ratio {entry['ratio']:.3g}: absolute BER={display(entry['ber'])}, changed BER={display(entry['changed_ber'])}, unchanged BER={display(entry['unchanged_ber'])}, transition-mask BER={display(entry['transition_mask_ber'])}, recall={display(entry['transition_recall'])}, precision={display(entry['transition_precision'])}, F1={display(entry['transition_f1'])}, missed={display(entry['missed_flip_rate'])}, false={display(entry['false_flip_rate'])}, 0->1 recall={display(entry['zero_to_one_direction_recall'])}, 1->0 recall={display(entry['one_to_zero_direction_recall'])}, expected/observed={entry['expected_transition_cells']}/{entry['observed_transition_cells']}")
 
 if __name__ == "__main__": main()

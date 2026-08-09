@@ -9,11 +9,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 try:
     from fvm0_common import LumaStats, decode_frame
-    from fvm0_temporal_common import TemporalConfig, aggregate_ratios, temporal_frames
+    from fvm0_temporal_common import TRANSITION_FIELDS, TemporalConfig, aggregate_ratios, measure_transition, temporal_frames
     from fvm0_temporal_analyze import analyze
 except ImportError:
     from scripts.fvm0_common import LumaStats, decode_frame
-    from scripts.fvm0_temporal_common import TemporalConfig, aggregate_ratios, temporal_frames
+    from scripts.fvm0_temporal_common import TRANSITION_FIELDS, TemporalConfig, aggregate_ratios, measure_transition, temporal_frames
     from scripts.fvm0_temporal_analyze import analyze
 
 
@@ -36,16 +36,28 @@ def decode(video: Path, manifest_path: Path, output: Path) -> dict:
     width,height=int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)); fps=float(capture.get(cv2.CAP_PROP_FPS))
     if (width,height)!=(config.width,config.height): capture.release(); raise RuntimeError("video resolution does not match manifest")
     records=[]; spatial=np.zeros((config.rows,config.cols),dtype=np.uint64); luma_stats={}
+    previous_expected=previous_actual=None; previous_block=None; previous_phase=None
     for metadata,bits,mask in temporal_frames(config,manifest["schedule"]):
         ok,frame=capture.read()
         if not ok: break
         actual,luma=decode_frame(frame,config); errors=actual!=bits; spatial+=errors
         row={**metadata,"bit_errors":int(errors.sum()),"ber":float(errors.mean()),"zero_to_one":int(((bits==0)&(actual==1)).sum()),"one_to_zero":int(((bits==1)&(actual==0)).sum()),"changed_cells":None,"changed_bit_errors":None,"changed_ber":None,"unchanged_cells":None,"unchanged_bit_errors":None,"unchanged_ber":None}
+        row.update({field:None for field in TRANSITION_FIELDS})
         if mask is not None:
             row.update(changed_cells=int(mask.sum()),changed_bit_errors=int((errors&mask).sum()),changed_ber=float((errors&mask).sum()/mask.sum()),unchanged_cells=int((~mask).sum()),unchanged_bit_errors=int((errors&~mask).sum()),unchanged_ber=float((errors&~mask).sum()/(~mask).sum()))
+            if previous_block!=metadata["block_index"] or previous_phase is None or metadata["phase"]!=previous_phase+1:
+                raise RuntimeError("non-contiguous FVM0-T frames cannot be measured without synchronization")
+            transition=measure_transition(previous_expected,bits,previous_actual,actual)
+            if not np.array_equal(previous_expected != bits, mask):
+                raise RuntimeError("generated transition mask does not match expected state XOR")
+            if transition["expected_transition_cells"]!=metadata["flip_count"]:
+                raise RuntimeError("expected transition count does not match manifest flip_count")
+            row.update(transition)
         if not metadata["is_warmup"] and not metadata["is_anchor"]:
             key=str(float(metadata["transition_ratio"])); pair=luma_stats.setdefault(key,(LumaStats(),LumaStats())); pair[0].add(luma[bits==0]); pair[1].add(luma[bits==1])
         records.append(row)
+        previous_expected,previous_actual=bits,actual
+        previous_block,previous_phase=metadata["block_index"],metadata["phase"]
     actual_frames=len(records)
     while capture.read()[0]: actual_frames+=1
     capture.release()
