@@ -14,9 +14,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 try:
-    from fvm0_temporal_common import TRANSITION_FIELDS, aggregate_ratios
+    from fvm0_temporal_common import SOFT_CORE_FIELDS, SOFT_PREFIXES, TRANSITION_FIELDS, aggregate_ratios
 except ImportError:
-    from scripts.fvm0_temporal_common import TRANSITION_FIELDS, aggregate_ratios
+    from scripts.fvm0_temporal_common import SOFT_CORE_FIELDS, SOFT_PREFIXES, TRANSITION_FIELDS, aggregate_ratios
 
 REQUIRED_COLUMNS = {"frame_index", "block_index", "phase", "is_anchor", "is_warmup",
                     "transition_ratio", "flip_count", "bit_errors", "ber", "zero_to_one",
@@ -29,6 +29,9 @@ def load_records(path: Path) -> list[dict[str, Any]]:
         reader = csv.DictReader(handle)
         if reader.fieldnames and not set(TRANSITION_FIELDS) <= set(reader.fieldnames):
             raise RuntimeError("transition-mask metrics are unavailable; re-run fvm0_temporal_decode with the updated decoder")
+        soft_fields={prefix+field for prefix in SOFT_PREFIXES for field in SOFT_CORE_FIELDS}
+        if reader.fieldnames and not soft_fields <= set(reader.fieldnames):
+            raise RuntimeError("soft fixed-weight metrics are unavailable; re-run fvm0_temporal_decode with the updated decoder")
         if not reader.fieldnames or not REQUIRED_COLUMNS <= set(reader.fieldnames):
             raise RuntimeError("frames CSV is empty or missing required columns")
         rows = list(reader)
@@ -39,6 +42,10 @@ def load_records(path: Path) -> list[dict[str, Any]]:
         for key in TRANSITION_FIELDS:
             if key not in ("transition_mask_ber","transition_recall","transition_precision","transition_f1","missed_flip_rate","false_flip_rate","zero_to_one_direction_recall","one_to_zero_direction_recall","transition_direction_accuracy"):
                 row[key]=int(row[key] or 0)
+        for prefix in SOFT_PREFIXES:
+            for key in SOFT_CORE_FIELDS:
+                if key not in ("transition_mask_ber","transition_recall","transition_precision","transition_f1","missed_flip_rate","false_flip_rate","swap_error_rate"):
+                    row[prefix+key]=int(row[prefix+key] or 0)
         for key in ("is_anchor", "is_warmup"): row[key] = row[key] == "True"
         row["transition_ratio"] = float(row["transition_ratio"]) if row["transition_ratio"] else None
         row["ber"] = float(row["ber"])
@@ -58,7 +65,7 @@ def probe_frames(video: Path) -> list[dict[str, Any]]:
     return payload["frames"]
 
 
-def _plot_basic(directory: Path, ratios: dict[str, Any], luminance: dict[str, Any]) -> None:
+def _plot_basic(directory: Path, ratios: dict[str, Any], luminance: dict[str, Any], score_stats: dict[str, Any]) -> None:
     entries = list(ratios.values()); x = [e["ratio"]*100 for e in entries]
     figures = [
         ("fvm0_temporal_ber_vs_ratio.png", [e["ber"] for e in entries], None, "aggregate BER", "FVM0-T BER by transition ratio"),
@@ -76,6 +83,19 @@ def _plot_basic(directory: Path, ratios: dict[str, Any], luminance: dict[str, An
         ("fvm0_temporal_transition_direction.png",[e["zero_to_one_direction_recall"] for e in entries],[e["one_to_zero_direction_recall"] for e in entries],"0->1 direction recall","1->0 direction recall")]
     for name,first,second,label1,label2 in transition_figures:
         fig,ax=plt.subplots();ax.plot(x,first,marker="o",label=label1);ax.plot(x,second,marker="o",label=label2);ax.set(xlabel="transition ratio (%)",ylabel="rate");ax.legend();fig.tight_layout();fig.savefig(directory/name);plt.close(fig)
+    soft_figures=[
+        ("fvm0_temporal_soft_mask_ber_vs_ratio.png","transition_mask_ber","mask BER"),
+        ("fvm0_temporal_soft_recall_vs_ratio.png","transition_recall","recall"),
+        ("fvm0_temporal_soft_precision_vs_ratio.png","transition_precision","precision")]
+    for name,metric,ylabel in soft_figures:
+        fig,ax=plt.subplots();ax.plot(x,[e[metric] for e in entries],marker="o",label="HARD_XOR");ax.plot(x,[e["soft_abs_"+metric] for e in entries],marker="o",label="ABS_DELTA_TOP_M");ax.plot(x,[e["soft_state_"+metric] for e in entries],marker="o",label="STATE_AWARE_TOP_M");ax.set(xlabel="transition ratio (%)",ylabel=ylabel);ax.legend();fig.tight_layout();fig.savefig(directory/name);plt.close(fig)
+    fig,ax=plt.subplots();ax.plot(x,[e["soft_abs_relative_ber_reduction"] for e in entries],marker="o",label="hard -> abs");ax.plot(x,[e["soft_state_relative_ber_reduction"] for e in entries],marker="o",label="hard -> state");ax.set(xlabel="transition ratio (%)",ylabel="relative BER reduction");ax.legend();fig.tight_layout();fig.savefig(directory/"fvm0_temporal_soft_gain_vs_ratio.png");plt.close(fig)
+    if score_stats:
+        fig,ax=plt.subplots()
+        for mode,label in (("abs_delta","ABS transition"),("state_aware","STATE transition")):
+            ax.plot(x,[score_stats[str(e["ratio"])][mode]["expected_transition"]["p50"] for e in entries],marker="o",label=label)
+            ax.plot(x,[score_stats[str(e["ratio"])][mode]["expected_unchanged"]["p50"] for e in entries],marker="o",linestyle="--",label=label.replace("transition","unchanged"))
+        ax.set(xlabel="transition ratio (%)",ylabel="median score",title="Soft score separation diagnostic");ax.legend();fig.tight_layout();fig.savefig(directory/"fvm0_temporal_soft_score_separation.png");plt.close(fig)
     if luminance:
         zero = [luminance[str(e["ratio"])]["expected_zero"]["p99"] for e in entries]
         one = [luminance[str(e["ratio"])]["expected_one"]["p1"] for e in entries]
@@ -118,7 +138,7 @@ def analyze(directory: Path, ffprobe_video: Path | None = None) -> dict[str, Any
     try: results = json.loads((directory/"fvm0_temporal_results.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc: raise RuntimeError("missing or malformed FVM0-T results JSON") from exc
     ratios = aggregate_ratios(records, results["matrix"]["cells_per_frame"], results["video"]["expected_fps"], results["experiment"]["block_size"])
-    results["ratios"] = ratios; _plot_basic(directory, ratios, results.get("luminance_by_ratio", {}))
+    results["ratios"] = ratios; _plot_basic(directory, ratios, results.get("luminance_by_ratio", {}), results.get("soft_score_by_ratio", {}))
     if ffprobe_video:
         frames = probe_frames(ffprobe_video); results["codec_analysis"] = _codec_analysis(directory, records, frames, results["matrix"]["cells_per_frame"])
         if len(frames) != len(records):
@@ -137,5 +157,7 @@ def main() -> None:
     def display(value): return "null" if value is None else f"{value:.6g}"
     for entry in results["ratios"].values():
         print(f"ratio {entry['ratio']:.3g}: absolute BER={display(entry['ber'])}, changed BER={display(entry['changed_ber'])}, unchanged BER={display(entry['unchanged_ber'])}, transition-mask BER={display(entry['transition_mask_ber'])}, recall={display(entry['transition_recall'])}, precision={display(entry['transition_precision'])}, F1={display(entry['transition_f1'])}, missed={display(entry['missed_flip_rate'])}, false={display(entry['false_flip_rate'])}, 0->1 recall={display(entry['zero_to_one_direction_recall'])}, 1->0 recall={display(entry['one_to_zero_direction_recall'])}, expected/observed={entry['expected_transition_cells']}/{entry['observed_transition_cells']}")
+        print(f"  ABS_DELTA_TOP_M: BER={display(entry['soft_abs_transition_mask_ber'])}, recall={display(entry['soft_abs_transition_recall'])}, precision={display(entry['soft_abs_transition_precision'])}, swap rate={display(entry['soft_abs_swap_error_rate'])}, observed={entry['soft_abs_observed_transition_cells']}, gain={display(entry['soft_abs_relative_ber_reduction'])}")
+        print(f"  STATE_AWARE_TOP_M: BER={display(entry['soft_state_transition_mask_ber'])}, recall={display(entry['soft_state_transition_recall'])}, precision={display(entry['soft_state_transition_precision'])}, swap rate={display(entry['soft_state_swap_error_rate'])}, observed={entry['soft_state_observed_transition_cells']}, gain={display(entry['soft_state_relative_ber_reduction'])}")
 
 if __name__ == "__main__": main()

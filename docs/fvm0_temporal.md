@@ -16,6 +16,12 @@ For adjacent non-anchor frames within one block, the expected mask is `expected_
 
 Ratio aggregates use total counts, never the mean of per-frame rates. The analyzer produces `fvm0_temporal_transition_mask_ber_vs_ratio.png`, `fvm0_temporal_transition_error_types_vs_ratio.png`, `fvm0_temporal_transition_precision_recall.png`, and `fvm0_temporal_transition_direction.png`. Older frame CSV files lack these fields; re-run the updated decoder into a new result directory before analysis.
 
+## Soft fixed-weight decoder probe
+
+The original `HARD_XOR` detector remains unchanged. `ABS_DELTA_TOP_M` ranks cells by `abs(current_luma - previous_luma)`. `STATE_AWARE_TOP_M` uses `(current_luma - previous_luma)` when the observable previous hard state is zero and its negative when that state is one. Both select exactly the manifest weight `m`; equal scores prefer the lower flat cell index. Expected states are used only after selection to measure performance, never to choose cells.
+
+Fixed-weight results report mask BER, precision, recall, F1, missed/false rates, and swap error rate `FN/m`. Because expected and observed weights are both `m`, `FN == FP` is enforced. Score distributions are streamed rather than retained: ABS scores use rounded/clipped bins 0..255 and state-aware scores use -255..255. The analyzer adds mask-BER, recall, precision, relative-gain, and score-separation plots for the three detectors. These measurements are an A/B decoder probe, not payload rank/unrank or FEC.
+
 To preserve the previous absolute experiment for comparison, decode an existing platform rendition into a new directory:
 
 ```powershell

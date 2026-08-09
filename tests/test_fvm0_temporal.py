@@ -5,9 +5,9 @@ import pytest
 import csv
 import subprocess
 from pathlib import Path
-from scripts.fvm0_temporal_common import TemporalConfig, aggregate_ratios, flip_count, measure_transition, temporal_frames, theoretical_bits
+from scripts.fvm0_temporal_common import SOFT_CORE_FIELDS, TRANSITION_FIELDS, ScoreStats, TemporalConfig, aggregate_ratios, fixed_weight_top_m, flip_count, measure_transition, measure_transition_masks, soft_transition_scores, temporal_frames, theoretical_bits
 from scripts.fvm0_common import decode_frame, render_bits
-from scripts.fvm0_temporal_analyze import load_records, probe_frames
+from scripts.fvm0_temporal_analyze import REQUIRED_COLUMNS, load_records, probe_frames
 from scripts.fvm0_temporal_decode import frame_warnings
 
 def test_default_geometry():
@@ -49,7 +49,15 @@ def test_exact_transitions_and_anchor_reset():
 def _records():
     transition={"expected_transition_cells":3,"observed_transition_cells":3,"transition_true_positive":2,"transition_missed":1,"transition_false_positive":1,"transition_true_negative":6,"transition_mask_errors":2,"expected_zero_to_one_transitions":2,"correct_zero_to_one_transitions":1,"opposite_zero_to_one_transitions":0,"missed_zero_to_one_transitions":1,"expected_one_to_zero_transitions":1,"correct_one_to_zero_transitions":1,"opposite_one_to_zero_transitions":0,"missed_one_to_zero_transitions":0}
     low={**transition,"expected_transition_cells":1,"observed_transition_cells":1,"transition_true_positive":1,"transition_missed":0,"transition_false_positive":0,"transition_true_negative":9}
-    return [{'is_warmup':True,'is_anchor':False,'transition_ratio':.3,'bit_errors':99,'changed_bit_errors':99,'unchanged_bit_errors':0,'flip_count':3,'block_index':0,'zero_to_one':0,'one_to_zero':0},{'is_warmup':False,'is_anchor':True,'transition_ratio':None,'bit_errors':99,'changed_bit_errors':0,'unchanged_bit_errors':0,'flip_count':0,'block_index':1,'zero_to_one':0,'one_to_zero':0},{'is_warmup':False,'is_anchor':False,'transition_ratio':.3,'bit_errors':3,'changed_bit_errors':2,'unchanged_bit_errors':1,'flip_count':3,'block_index':1,'zero_to_one':1,'one_to_zero':2,**transition},{'is_warmup':False,'is_anchor':False,'transition_ratio':.1,'bit_errors':1,'changed_bit_errors':1,'unchanged_bit_errors':0,'flip_count':1,'block_index':2,'zero_to_one':1,'one_to_zero':0,**low}]
+    rows=[{'is_warmup':True,'is_anchor':False,'transition_ratio':.3,'bit_errors':99,'changed_bit_errors':99,'unchanged_bit_errors':0,'flip_count':3,'block_index':0,'zero_to_one':0,'one_to_zero':0},{'is_warmup':False,'is_anchor':True,'transition_ratio':None,'bit_errors':99,'changed_bit_errors':0,'unchanged_bit_errors':0,'flip_count':0,'block_index':1,'zero_to_one':0,'one_to_zero':0},{'is_warmup':False,'is_anchor':False,'transition_ratio':.3,'bit_errors':3,'changed_bit_errors':2,'unchanged_bit_errors':1,'flip_count':3,'block_index':1,'zero_to_one':1,'one_to_zero':2,**transition},{'is_warmup':False,'is_anchor':False,'transition_ratio':.1,'bit_errors':1,'changed_bit_errors':1,'unchanged_bit_errors':0,'flip_count':1,'block_index':2,'zero_to_one':1,'one_to_zero':0,**low}]
+    for row in rows[2:]:
+        for prefix in ('soft_abs_','soft_state_'):
+            for field in SOFT_CORE_FIELDS:
+                if field=='swap_errors': value=row['transition_missed']
+                elif field=='swap_error_rate': value=row['transition_missed']/row['expected_transition_cells']
+                else: value=row.get(field,0)
+                row[prefix+field]=value
+    return rows
 
 def test_aggregate_sort_exclusion_denominators_and_rate():
     out=aggregate_ratios(_records(),10,10,5); assert list(out)==['0.1','0.3']; row=out['0.3']
@@ -66,6 +74,9 @@ def test_empty_or_malformed_csv_has_clear_error(tmp_path):
     with pytest.raises(RuntimeError,match="empty"): load_records(tmp_path/"empty.csv")
     (tmp_path/"legacy.csv").write_text("frame_index,block_index,phase,is_anchor,is_warmup,transition_ratio,flip_count,bit_errors,ber,zero_to_one,one_to_zero,changed_bit_errors,unchanged_bit_errors\n",encoding="utf-8")
     with pytest.raises(RuntimeError,match="transition-mask metrics are unavailable"): load_records(tmp_path/"legacy.csv")
+    hard_only=sorted(REQUIRED_COLUMNS|set(TRANSITION_FIELDS))
+    (tmp_path/"hard.csv").write_text(",".join(hard_only)+"\n",encoding="utf-8")
+    with pytest.raises(RuntimeError,match="soft fixed-weight metrics are unavailable"): load_records(tmp_path/"hard.csv")
 
 def test_ffprobe_json_and_errors(monkeypatch):
     class Completed:
@@ -102,3 +113,30 @@ def test_transition_weighted_aggregate_uses_total_counts():
     result=aggregate_ratios([first,second],100,10,5)['0.3']
     assert result['transition_recall']==18/30
     assert result['transition_precision']==18/21
+
+def test_fixed_weight_top_m_and_tie_break():
+    assert np.flatnonzero(fixed_weight_top_m(np.array([10,100,50,90,20]),2)).tolist()==[1,3]
+    expected=[1,2]
+    for _ in range(3): assert np.flatnonzero(fixed_weight_top_m(np.array([10,50,50,50,20]),2)).tolist()==expected
+
+def test_abs_and_state_aware_scores():
+    previous=np.array([10,120,200,100]);current=np.array([100,125,100,101])
+    assert np.flatnonzero(fixed_weight_top_m(soft_transition_scores(previous,current,'abs_delta'),2)).tolist()==[0,2]
+    previous=np.array([20,230,20,230]);current=np.array([100,150,10,240])
+    assert soft_transition_scores(previous,current,'state_aware').tolist()==[80,80,-10,-10]
+    assert np.flatnonzero(fixed_weight_top_m(soft_transition_scores(previous,current,'state_aware'),2)).tolist()==[0,1]
+
+def test_fixed_weight_confusion_invariant():
+    result=measure_transition_masks(np.array([1,1,1,0,0],dtype=bool),np.array([1,1,0,1,0],dtype=bool))
+    assert result['transition_true_positive']==2
+    assert result['transition_missed']==result['transition_false_positive']==1
+    assert result['swap_errors']==1
+
+def test_soft_weighted_aggregate_and_score_histogram():
+    rows=_records(); rows[2]["soft_abs_transition_true_positive"]=1;rows[2]["soft_abs_transition_missed"]=2;rows[2]["soft_abs_transition_false_positive"]=2;rows[2]["soft_abs_transition_true_negative"]=5;rows[2]["soft_abs_observed_transition_cells"]=3;rows[2]["soft_abs_swap_errors"]=2
+    result=aggregate_ratios(rows,10,10,5)['0.3']
+    assert result['soft_abs_transition_recall']==1/3
+    assert result['soft_abs_transition_precision']==1/3
+    assert result['soft_abs_transition_missed']==result['soft_abs_transition_false_positive']==2
+    stats=ScoreStats(-255,255);stats.add(np.array([-1.2,0.2,2.8]));summary=stats.summary()
+    assert summary['count']==3 and len(summary['histogram'])==511 and summary['p50']==0

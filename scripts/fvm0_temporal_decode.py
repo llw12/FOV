@@ -9,11 +9,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 try:
     from fvm0_common import LumaStats, decode_frame
-    from fvm0_temporal_common import TRANSITION_FIELDS, TemporalConfig, aggregate_ratios, measure_transition, temporal_frames
+    from fvm0_temporal_common import SOFT_CORE_FIELDS, SOFT_PREFIXES, TRANSITION_FIELDS, ScoreStats, TemporalConfig, aggregate_ratios, fixed_weight_top_m, measure_transition, measure_transition_masks, soft_transition_scores, temporal_frames
     from fvm0_temporal_analyze import analyze
 except ImportError:
     from scripts.fvm0_common import LumaStats, decode_frame
-    from scripts.fvm0_temporal_common import TRANSITION_FIELDS, TemporalConfig, aggregate_ratios, measure_transition, temporal_frames
+    from scripts.fvm0_temporal_common import SOFT_CORE_FIELDS, SOFT_PREFIXES, TRANSITION_FIELDS, ScoreStats, TemporalConfig, aggregate_ratios, fixed_weight_top_m, measure_transition, measure_transition_masks, soft_transition_scores, temporal_frames
     from scripts.fvm0_temporal_analyze import analyze
 
 
@@ -36,13 +36,15 @@ def decode(video: Path, manifest_path: Path, output: Path) -> dict:
     width,height=int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)); fps=float(capture.get(cv2.CAP_PROP_FPS))
     if (width,height)!=(config.width,config.height): capture.release(); raise RuntimeError("video resolution does not match manifest")
     records=[]; spatial=np.zeros((config.rows,config.cols),dtype=np.uint64); luma_stats={}
-    previous_expected=previous_actual=None; previous_block=None; previous_phase=None
+    previous_expected=previous_actual=previous_luma=None; previous_block=None; previous_phase=None
+    score_stats={}
     for metadata,bits,mask in temporal_frames(config,manifest["schedule"]):
         ok,frame=capture.read()
         if not ok: break
         actual,luma=decode_frame(frame,config); errors=actual!=bits; spatial+=errors
         row={**metadata,"bit_errors":int(errors.sum()),"ber":float(errors.mean()),"zero_to_one":int(((bits==0)&(actual==1)).sum()),"one_to_zero":int(((bits==1)&(actual==0)).sum()),"changed_cells":None,"changed_bit_errors":None,"changed_ber":None,"unchanged_cells":None,"unchanged_bit_errors":None,"unchanged_ber":None}
         row.update({field:None for field in TRANSITION_FIELDS})
+        row.update({prefix+field:None for prefix in SOFT_PREFIXES for field in SOFT_CORE_FIELDS})
         if mask is not None:
             row.update(changed_cells=int(mask.sum()),changed_bit_errors=int((errors&mask).sum()),changed_ber=float((errors&mask).sum()/mask.sum()),unchanged_cells=int((~mask).sum()),unchanged_bit_errors=int((errors&~mask).sum()),unchanged_ber=float((errors&~mask).sum()/(~mask).sum()))
             if previous_block!=metadata["block_index"] or previous_phase is None or metadata["phase"]!=previous_phase+1:
@@ -53,10 +55,21 @@ def decode(video: Path, manifest_path: Path, output: Path) -> dict:
             if transition["expected_transition_cells"]!=metadata["flip_count"]:
                 raise RuntimeError("expected transition count does not match manifest flip_count")
             row.update(transition)
+            expected_mask=previous_expected!=bits
+            for mode,prefix in (("abs_delta","soft_abs_"),("state_aware","soft_state_")):
+                scores=soft_transition_scores(previous_luma,luma,mode)
+                observed_mask=fixed_weight_top_m(scores,metadata["flip_count"])
+                metrics=measure_transition_masks(expected_mask,observed_mask)
+                if metrics["observed_transition_cells"]!=metadata["flip_count"] or metrics["transition_missed"]!=metrics["transition_false_positive"]:
+                    raise RuntimeError("soft fixed-weight detector invariant violated")
+                row.update({prefix+field:metrics[field] for field in SOFT_CORE_FIELDS})
+                if not metadata["is_warmup"]:
+                    ratio_key=str(float(metadata["transition_ratio"]));mode_stats=score_stats.setdefault(ratio_key,{}).setdefault(mode,{"expected_transition":ScoreStats(0,255) if mode=="abs_delta" else ScoreStats(-255,255),"expected_unchanged":ScoreStats(0,255) if mode=="abs_delta" else ScoreStats(-255,255)})
+                    mode_stats["expected_transition"].add(scores[expected_mask]);mode_stats["expected_unchanged"].add(scores[~expected_mask])
         if not metadata["is_warmup"] and not metadata["is_anchor"]:
             key=str(float(metadata["transition_ratio"])); pair=luma_stats.setdefault(key,(LumaStats(),LumaStats())); pair[0].add(luma[bits==0]); pair[1].add(luma[bits==1])
         records.append(row)
-        previous_expected,previous_actual=bits,actual
+        previous_expected,previous_actual,previous_luma=bits,actual,luma
         previous_block,previous_phase=metadata["block_index"],metadata["phase"]
     actual_frames=len(records)
     while capture.read()[0]: actual_frames+=1
@@ -71,7 +84,8 @@ def decode(video: Path, manifest_path: Path, output: Path) -> dict:
     for ratio in sorted(luma_stats, key=float):
         zero,one=luma_stats[ratio]
         zs,os=zero.summary(),one.summary(); luminance[ratio]={"expected_zero":zs,"expected_one":os,"expected_zero_histogram":zero.histogram.tolist(),"expected_one_histogram":one.histogram.tolist(),"p1_p99_margin":os["p1"]-zs["p99"]}
-    result={"format":manifest["format"],"video":{"expected_resolution":f"{config.width}x{config.height}","actual_resolution":f"{width}x{height}","expected_fps":config.fps,"actual_fps":fps,"expected_frames":expected_frames,"actual_frames":actual_frames,"compared_frames":len(records)},"matrix":{"cell_size":config.cell_size,"rows":config.rows,"columns":config.cols,"cells_per_frame":config.cells_per_frame},"experiment":manifest,"overall":_summary(records,config.cells_per_frame),"warmup":_summary([r for r in records if r["is_warmup"]],config.cells_per_frame),"anchors":_summary([r for r in records if r["is_anchor"]],config.cells_per_frame),"ratios":aggregate_ratios(records,config.cells_per_frame,config.fps,config.block_size),"luminance_by_ratio":luminance,"warnings":warnings}
+    score_summary={ratio:{mode:{kind:stats.summary() for kind,stats in kinds.items()} for mode,kinds in score_stats[ratio].items()} for ratio in sorted(score_stats,key=float)}
+    result={"format":manifest["format"],"video":{"expected_resolution":f"{config.width}x{config.height}","actual_resolution":f"{width}x{height}","expected_fps":config.fps,"actual_fps":fps,"expected_frames":expected_frames,"actual_frames":actual_frames,"compared_frames":len(records)},"matrix":{"cell_size":config.cell_size,"rows":config.rows,"columns":config.cols,"cells_per_frame":config.cells_per_frame},"experiment":manifest,"overall":_summary(records,config.cells_per_frame),"warmup":_summary([r for r in records if r["is_warmup"]],config.cells_per_frame),"anchors":_summary([r for r in records if r["is_anchor"]],config.cells_per_frame),"ratios":aggregate_ratios(records,config.cells_per_frame,config.fps,config.block_size),"luminance_by_ratio":luminance,"soft_score_by_ratio":score_summary,"warnings":warnings}
     (output/"fvm0_temporal_results.json").write_text(json.dumps(result,indent=2),encoding="utf-8")
     fig,ax=plt.subplots(figsize=(12,6)); image=ax.imshow(spatial,aspect="auto",cmap="magma");ax.set_title("FVM0-T cell error count - all compared frames");fig.colorbar(image,ax=ax);fig.tight_layout();fig.savefig(output/"fvm0_temporal_error_heatmap.png");plt.close(fig)
     return analyze(output)

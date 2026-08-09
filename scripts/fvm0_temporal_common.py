@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import median
 from typing import Any, Iterator
 
@@ -157,10 +157,86 @@ TRANSITION_FIELDS = (
     "zero_to_one_direction_recall", "one_to_zero_direction_recall",
     "transition_direction_accuracy",
 )
+SOFT_CORE_FIELDS = (
+    "expected_transition_cells", "observed_transition_cells", "transition_true_positive",
+    "transition_missed", "transition_false_positive", "transition_true_negative",
+    "transition_mask_errors", "transition_mask_ber", "transition_recall",
+    "transition_precision", "transition_f1", "missed_flip_rate", "false_flip_rate",
+    "swap_errors", "swap_error_rate",
+)
+SOFT_PREFIXES = ("soft_abs_", "soft_state_")
+
+
+@dataclass
+class ScoreStats:
+    """Streaming rounded-score statistics over a fixed inclusive integer range."""
+    minimum_bin: int
+    maximum_bin: int
+    count: int = 0
+    total: float = 0.0
+    total_squared: float = 0.0
+    minimum: float | None = None
+    maximum: float | None = None
+    histogram: np.ndarray = field(init=False)
+
+    def __post_init__(self): self.histogram=np.zeros(self.maximum_bin-self.minimum_bin+1,dtype=np.int64)
+    def add(self, values: np.ndarray):
+        flat=values.astype(np.float64,copy=False).ravel()
+        if not flat.size: return
+        self.count+=flat.size;self.total+=float(flat.sum());self.total_squared+=float(np.square(flat).sum())
+        self.minimum=float(flat.min()) if self.minimum is None else min(self.minimum,float(flat.min()))
+        self.maximum=float(flat.max()) if self.maximum is None else max(self.maximum,float(flat.max()))
+        bins=np.clip(np.rint(flat),self.minimum_bin,self.maximum_bin).astype(np.intp)-self.minimum_bin
+        self.histogram+=np.bincount(bins,minlength=self.histogram.size)
+    def summary(self):
+        if not self.count: return {"count":0,"mean":None,"std":None,"min":None,"max":None,"p1":None,"p5":None,"p50":None,"p95":None,"p99":None}
+        mean=self.total/self.count;variance=max(0,self.total_squared/self.count-mean*mean);cumulative=np.cumsum(self.histogram)
+        def percentile(p): return float(np.searchsorted(cumulative,math.ceil(self.count*p/100),side="left")+self.minimum_bin)
+        return {"count":self.count,"mean":mean,"std":math.sqrt(variance),"min":self.minimum,"max":self.maximum,**{f"p{p}":percentile(p) for p in (1,5,50,95,99)},"histogram":self.histogram.tolist(),"histogram_min":self.minimum_bin,"histogram_max":self.maximum_bin}
 
 
 def _ratio(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
+
+
+def fixed_weight_top_m(scores: np.ndarray, m: int) -> np.ndarray:
+    """Select exactly m largest scores; ties prefer the lower flat index."""
+    flat=np.asarray(scores).ravel()
+    if not isinstance(m,int) or isinstance(m,bool) or not 0 <= m <= flat.size:
+        raise ValueError("m must be an integer in [0, score count]")
+    selected=np.zeros(flat.size,dtype=bool)
+    if m==0: return selected.reshape(scores.shape)
+    threshold=np.partition(flat,flat.size-m)[flat.size-m]
+    selected[flat>threshold]=True
+    remaining=m-int(selected.sum())
+    tied=np.flatnonzero(flat==threshold)
+    selected[tied[:remaining]]=True
+    return selected.reshape(scores.shape)
+
+
+def soft_transition_scores(previous_luma: np.ndarray, current_luma: np.ndarray, mode: str) -> np.ndarray:
+    """Compute observable-only soft transition evidence."""
+    if previous_luma.shape!=current_luma.shape: raise ValueError("luma arrays must have identical shapes")
+    delta=current_luma.astype(np.float64)-previous_luma.astype(np.float64)
+    if mode=="abs_delta": return np.abs(delta)
+    if mode=="state_aware": return np.where(previous_luma>=128,-delta,delta)
+    raise ValueError(f"unsupported soft transition score mode: {mode}")
+
+
+def measure_transition_masks(expected: np.ndarray, observed: np.ndarray) -> dict[str, Any]:
+    """Measure a predicted transition mask against truth without affecting prediction."""
+    if expected.shape!=observed.shape: raise ValueError("transition masks must have identical shapes")
+    expected=expected.astype(bool,copy=False);observed=observed.astype(bool,copy=False)
+    tp=int((expected&observed).sum());fn=int((expected&~observed).sum())
+    fp=int((~expected&observed).sum());tn=int((~expected&~observed).sum())
+    precision=_ratio(tp,tp+fp);recall=_ratio(tp,tp+fn)
+    f1=None if precision is None or recall is None or precision+recall==0 else 2*precision*recall/(precision+recall)
+    return {"expected_transition_cells":tp+fn,"observed_transition_cells":tp+fp,
+            "transition_true_positive":tp,"transition_missed":fn,"transition_false_positive":fp,
+            "transition_true_negative":tn,"transition_mask_errors":fn+fp,
+            "transition_mask_ber":(fn+fp)/expected.size,"transition_recall":recall,
+            "transition_precision":precision,"transition_f1":f1,"missed_flip_rate":_ratio(fn,tp+fn),
+            "false_flip_rate":_ratio(fp,fp+tn),"swap_errors":fn,"swap_error_rate":_ratio(fn,tp+fn)}
 
 
 def measure_transition(expected_previous: np.ndarray, expected_current: np.ndarray,
@@ -171,8 +247,9 @@ def measure_transition(expected_previous: np.ndarray, expected_current: np.ndarr
         raise ValueError("transition arrays must have identical shapes")
     expected = expected_previous != expected_current
     observed = actual_previous != actual_current
-    tp = int((expected & observed).sum()); fn = int((expected & ~observed).sum())
-    fp = int((~expected & observed).sum()); tn = int((~expected & ~observed).sum())
+    mask_metrics=measure_transition_masks(expected,observed)
+    tp=mask_metrics["transition_true_positive"];fn=mask_metrics["transition_missed"]
+    fp=mask_metrics["transition_false_positive"];tn=mask_metrics["transition_true_negative"]
     expected_01 = expected & (expected_previous == 0); expected_10 = expected & (expected_previous == 1)
     actual_01 = observed & (actual_previous == 0); actual_10 = observed & (actual_previous == 1)
     e01=int(expected_01.sum()); e10=int(expected_10.sum())
@@ -180,12 +257,8 @@ def measure_transition(expected_previous: np.ndarray, expected_current: np.ndarr
     c10=int((expected_10 & actual_10).sum()); o10=int((expected_10 & actual_01).sum())
     precision=_ratio(tp,tp+fp); recall=_ratio(tp,tp+fn)
     f1=None if precision is None or recall is None or precision+recall==0 else 2*precision*recall/(precision+recall)
-    return {"expected_transition_cells":tp+fn,"observed_transition_cells":tp+fp,
-            "transition_true_positive":tp,"transition_missed":fn,"transition_false_positive":fp,
-            "transition_true_negative":tn,"transition_mask_errors":fn+fp,
-            "transition_mask_ber":(fn+fp)/expected.size,"transition_recall":recall,
-            "transition_precision":precision,"transition_f1":f1,"missed_flip_rate":_ratio(fn,tp+fn),
-            "false_flip_rate":_ratio(fp,fp+tn),"expected_zero_to_one_transitions":e01,
+    return {**{key:value for key,value in mask_metrics.items() if not key.startswith("swap_")},
+            "expected_zero_to_one_transitions":e01,
             "correct_zero_to_one_transitions":c01,"opposite_zero_to_one_transitions":o01,
             "missed_zero_to_one_transitions":e01-c01-o01,"expected_one_to_zero_transitions":e10,
             "correct_one_to_zero_transitions":c10,"opposite_one_to_zero_transitions":o10,
@@ -246,4 +319,23 @@ def aggregate_ratios(records: list[dict[str, Any]], cells: int, fps: int, block_
         result["zero_to_one_direction_recall"]=_ratio(result["correct_zero_to_one_transitions"],result["expected_zero_to_one_transitions"])
         result["one_to_zero_direction_recall"]=_ratio(result["correct_one_to_zero_transitions"],result["expected_one_to_zero_transitions"])
         result["transition_direction_accuracy"]=_ratio(result["correct_zero_to_one_transitions"]+result["correct_one_to_zero_transitions"],result["expected_transition_cells"])
+        for prefix in SOFT_PREFIXES:
+            for field in ("expected_transition_cells","observed_transition_cells","transition_true_positive",
+                          "transition_missed","transition_false_positive","transition_true_negative",
+                          "transition_mask_errors","swap_errors"):
+                result[prefix+field]=sum(int(row[prefix+field]) for row in rows)
+            stp=result[prefix+"transition_true_positive"];sfn=result[prefix+"transition_missed"]
+            sfp=result[prefix+"transition_false_positive"];stn=result[prefix+"transition_true_negative"]
+            if sfn!=sfp: raise RuntimeError("fixed-weight detector invariant violated: FN != FP")
+            if result[prefix+"observed_transition_cells"]!=result[prefix+"expected_transition_cells"]:
+                raise RuntimeError("fixed-weight detector invariant violated: observed weight != expected weight")
+            sp=_ratio(stp,stp+sfp);sr=_ratio(stp,stp+sfn)
+            result.update({prefix+"transition_mask_ber":(sfn+sfp)/(count*cells),prefix+"transition_recall":sr,
+                           prefix+"transition_precision":sp,prefix+"transition_f1":None if sp is None or sr is None or sp+sr==0 else 2*sp*sr/(sp+sr),
+                           prefix+"missed_flip_rate":_ratio(sfn,stp+sfn),prefix+"false_flip_rate":_ratio(sfp,sfp+stn),
+                           prefix+"swap_error_rate":_ratio(sfn,stp+sfn),prefix+"transition_count_bias":0.0,
+                           prefix+"mean_observed_transition_cells_per_frame":result[prefix+"observed_transition_cells"]/count})
+        hard=result["transition_mask_ber"]
+        result["soft_abs_relative_ber_reduction"]=None if hard==0 else (hard-result["soft_abs_transition_mask_ber"])/hard
+        result["soft_state_relative_ber_reduction"]=None if hard==0 else (hard-result["soft_state_transition_mask_ber"])/hard
     return output
