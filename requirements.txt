@@ -5,4 +5,5 @@ zxing-cpp
 numpy
 matplotlib
 pytest
+reedsolo==1.7.0
 yt-dlp
