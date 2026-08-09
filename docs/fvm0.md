@@ -12,7 +12,7 @@ FVM0 没有 QR、Base64、CRC、ECC、RaptorQ、header、同步、pilot、finder
 python scripts/fvm0_encode.py runs/fvm0-8px.mp4
 ```
 
-这会生成同名 sidecar manifest。矩阵来自 `numpy.random.Generator(PCG64(seed))`，由 seed 和 manifest 参数逐帧确定性复现；视频内部不保存任何 metadata。
+这会生成同名 sidecar manifest。新协议使用 `PCG64_RAW_LSB_V1`：逐帧调用 `PCG64.random_raw()`，将每个 uint64 按 LSB-first 展开。旧 sidecar 的 `PCG64` 保持原有 `Generator.integers()` 解释，绝不静默改释义；视频内部不保存任何 metadata。
 
 ## 分析
 

@@ -35,6 +35,8 @@ def default_manifest_path(output: Path) -> Path:
 def encode(output: Path, config: FVM0Config, crf: int, preset: str, manifest_path: Path) -> None:
     if crf < 0 or crf > 51:
         raise ValueError("crf must be between 0 and 51")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     command = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{config.width}x{config.height}",
                "-r", str(config.fps), "-i", "-", "-an", "-c:v", "libx264", "-crf", str(crf),
                "-preset", preset, "-pix_fmt", "yuv420p", str(output)]
@@ -56,9 +58,8 @@ def encode(output: Path, config: FVM0Config, crf: int, preset: str, manifest_pat
         raise
     manifest = config.manifest()
     manifest["source_video"] = output.name
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nFVM0 video: {output}\nManifest: {manifest_path}\nRaw probe rate: {config.raw_bytes_per_second} byte/s ({config.raw_bytes_per_second * 8} bit/s)")
+    print(f"\nFVM0 video: {output}\nManifest: {manifest_path}\nRaw probe rate: {config.raw_bytes_per_second:g} equivalent byte/s ({config.raw_bits_per_second} bit/s)")
 
 
 def main() -> None:

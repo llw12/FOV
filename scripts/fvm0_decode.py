@@ -57,7 +57,7 @@ def decode(video_path: Path, manifest_path: Path, output_dir: Path) -> dict:
         raise RuntimeError(f"video resolution {actual_width}x{actual_height} does not match manifest {config.width}x{config.height}")
     output_dir.mkdir(parents=True, exist_ok=True)
     measurements = Measurements(config)
-    expected = bit_matrices(config)
+    expected = bit_matrices(config, manifest["prng"])
     actual_frames = 0
     csv_path = output_dir / "fvm0_frames.csv"
     try:
@@ -78,20 +78,23 @@ def decode(video_path: Path, manifest_path: Path, output_dir: Path) -> dict:
                     print(f"\rFVM0 compared {measurements.compared_frames}/{config.frames} frames", end="", flush=True)
     finally:
         capture.release()
-    result = measurements.result(actual_frames)
+    result = measurements.result(actual_frames, actual_width=actual_width, actual_height=actual_height, actual_fps=actual_fps)
     result["parameters"] = config.manifest()
     result["top_error_cells"] = top_error_cells(measurements.spatial_errors, measurements.compared_frames)
-    result["warning"] = None if actual_frames == config.frames else (
-        "FVM0 has no synchronization metadata; frame insertion/deletion makes index-based BER after the synchronization loss unreliable."
-    )
+    warnings = []
+    if actual_frames != config.frames:
+        warnings.append("FVM0 has no synchronization metadata; frame insertion/deletion makes index-based BER after the synchronization loss unreliable.")
+    if abs(actual_fps - config.fps) > 0.01:
+        warnings.append("decoded FPS differs from manifest")
+    result["warnings"] = warnings
     result_path = output_dir / "fvm0_results.json"
     result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     render_heatmap(measurements.spatial_errors, output_dir / "fvm0_error_heatmap.png")
     render_luma_histogram(measurements, output_dir / "fvm0_luma_histogram.png")
     bits = result["bits"]
     frames = result["frames"]
-    print(f"\nVideo: {actual_width}x{actual_height}, {actual_fps:.3f} fps\nExpected frames: {config.frames}\nActual frames: {actual_frames}\nCompared frames: {measurements.compared_frames}")
-    print(f"Matrix: {config.rows}x{config.cols}, cell {config.cell_size}, {config.bits_per_frame} bits/frame, raw {config.raw_bytes_per_second} byte/s")
+    print(f"\nExpected video: {config.width}x{config.height}, {config.fps:.3f} fps\nActual video: {actual_width}x{actual_height}, {actual_fps:.3f} fps\nExpected frames: {config.frames}\nActual frames: {actual_frames}\nCompared frames: {measurements.compared_frames}")
+    print(f"Matrix: {config.rows}x{config.cols}, cell {config.cell_size}, {config.bits_per_frame} bits/frame, raw {config.raw_bytes_per_second:g} equivalent byte/s")
     print(f"Bits: total {bits['total_compared_bits']}, correct {bits['correct_bits']}, errors {bits['bit_errors']}, BER {bits['ber']}")
     if bits["bit_errors"] == 0:
         print("observed BER: 0")
@@ -101,8 +104,8 @@ def decode(video_path: Path, manifest_path: Path, output_dir: Path) -> dict:
     print(f"Luma expected 1: {result['luminance']['expected_one']}")
     if result["top_error_cells"]:
         print(f"Top error cells: {result['top_error_cells']}")
-    if result["warning"]:
-        print(f"WARNING: {result['warning']}")
+    for warning in warnings:
+        print(f"WARNING: {warning}")
     print(f"Results: {result_path}")
     return result
 

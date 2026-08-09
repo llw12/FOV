@@ -11,7 +11,9 @@ import numpy as np
 
 
 FORMAT = "FVM0_RAW"
-PRNG = "PCG64"
+LEGACY_PRNG = "PCG64"
+PRNG = "PCG64_RAW_LSB_V1"
+SUPPORTED_PRNGS = {LEGACY_PRNG, PRNG}
 
 
 @dataclass(frozen=True)
@@ -43,39 +45,57 @@ class FVM0Config:
         return self.rows * self.cols
 
     @property
-    def bytes_per_frame(self) -> int:
-        return self.bits_per_frame // 8
+    def equivalent_bytes_per_frame(self) -> float:
+        return self.bits_per_frame / 8.0
 
     @property
-    def raw_bytes_per_second(self) -> int:
-        return self.bytes_per_frame * self.fps
+    def raw_bits_per_second(self) -> int:
+        return self.bits_per_frame * self.fps
+
+    @property
+    def raw_bytes_per_second(self) -> float:
+        return self.raw_bits_per_second / 8.0
 
     def manifest(self) -> dict[str, Any]:
         return {"format": FORMAT, "width": self.width, "height": self.height, "fps": self.fps,
                 "cell_size": self.cell_size, "rows": self.rows, "cols": self.cols,
                 "bits_per_cell": 1, "bits_per_frame": self.bits_per_frame,
-                "bytes_per_frame": self.bytes_per_frame, "frames": self.frames,
+                "equivalent_bytes_per_frame": self.equivalent_bytes_per_frame, "frames": self.frames,
                 "seed": self.seed, "prng": PRNG}
 
     @classmethod
     def from_manifest(cls, manifest: dict[str, Any]) -> "FVM0Config":
         required = {"format", "width", "height", "fps", "cell_size", "rows", "cols", "bits_per_cell",
-                    "bits_per_frame", "bytes_per_frame", "frames", "seed", "prng"}
+                    "bits_per_frame", "frames", "seed", "prng"}
         if not isinstance(manifest, dict) or not required <= manifest.keys():
             raise ValueError("manifest is missing FVM0 fields")
-        if manifest["format"] != FORMAT or manifest["prng"] != PRNG or manifest["bits_per_cell"] != 1:
+        if manifest["format"] != FORMAT or manifest["prng"] not in SUPPORTED_PRNGS or manifest["bits_per_cell"] != 1:
             raise ValueError("unsupported FVM0 manifest")
         config = cls(*(manifest[name] for name in ("width", "height", "fps", "cell_size", "frames", "seed")))
-        if any(manifest[name] != getattr(config, name) for name in ("rows", "cols", "bits_per_frame", "bytes_per_frame")):
+        if any(manifest[name] != getattr(config, name) for name in ("rows", "cols", "bits_per_frame")):
             raise ValueError("manifest geometry does not match its parameters")
+        equivalent = manifest.get("equivalent_bytes_per_frame", manifest.get("bytes_per_frame"))
+        if equivalent is None or float(equivalent) != config.equivalent_bytes_per_frame:
+            raise ValueError("manifest equivalent bytes per frame does not match geometry")
         return config
 
 
-def bit_matrices(config: FVM0Config) -> Iterator[np.ndarray]:
+def bit_matrices(config: FVM0Config, prng: str = PRNG) -> Iterator[np.ndarray]:
     """Yield the protocol PRBS one frame at a time, without caching the stream."""
-    rng = np.random.Generator(np.random.PCG64(config.seed))
+    if prng == LEGACY_PRNG:
+        rng = np.random.Generator(np.random.PCG64(config.seed))
+        for _ in range(config.frames):
+            yield rng.integers(0, 2, size=(config.rows, config.cols), dtype=np.uint8)
+        return
+    if prng != PRNG:
+        raise ValueError(f"unsupported PRNG: {prng}")
+    generator = np.random.PCG64(config.seed)
+    shifts = np.arange(64, dtype=np.uint64)
+    words = math.ceil(config.bits_per_frame / 64)
     for _ in range(config.frames):
-        yield rng.integers(0, 2, size=(config.rows, config.cols), dtype=np.uint8)
+        raw = generator.random_raw(words).astype(np.uint64, copy=False)
+        bits = ((raw[:, None] >> shifts) & 1).astype(np.uint8).reshape(-1)
+        yield bits[:config.bits_per_frame].reshape(config.rows, config.cols)
 
 
 def render_bits(bits: np.ndarray, config: FVM0Config) -> np.ndarray:
@@ -181,13 +201,13 @@ class Measurements:
         return {"frame_index": frame_index, "bit_errors": error_count, "zero_to_one": zero_to_one,
                 "one_to_zero": one_to_zero, "ber": error_count / expected.size}
 
-    def result(self, actual_frames: int) -> dict[str, Any]:
-        return {"video": {"resolution": f"{self.config.width}x{self.config.height}", "fps": self.config.fps,
+    def result(self, actual_frames: int, *, actual_width: int | None = None, actual_height: int | None = None, actual_fps: float | None = None) -> dict[str, Any]:
+        return {"video": {"expected_resolution": f"{self.config.width}x{self.config.height}", "actual_resolution": f"{actual_width or self.config.width}x{actual_height or self.config.height}", "expected_fps": self.config.fps, "actual_fps": float(self.config.fps if actual_fps is None else actual_fps),
                            "expected_frames": self.config.frames, "actual_frames": actual_frames,
                            "compared_frames": self.compared_frames},
                 "matrix": {"cell_size": self.config.cell_size, "rows": self.config.rows, "columns": self.config.cols,
-                           "bits_per_frame": self.config.bits_per_frame, "bytes_per_frame": self.config.bytes_per_frame,
-                           "raw_bitrate_bps": self.config.raw_bytes_per_second * 8},
+                           "bits_per_frame": self.config.bits_per_frame, "equivalent_bytes_per_frame": self.config.equivalent_bytes_per_frame,
+                           "raw_bitrate_bps": self.config.raw_bits_per_second, "raw_equivalent_bytes_per_second": self.config.raw_bytes_per_second},
                 "bits": {"total_compared_bits": self.compared_bits, "correct_bits": self.correct_bits,
                          "bit_errors": self.bit_errors, "ber": self.bit_errors / self.compared_bits if self.compared_bits else None,
                          "zero_to_one": self.zero_to_one, "one_to_zero": self.one_to_zero},
