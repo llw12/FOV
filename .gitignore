@@ -13,3 +13,6 @@ smoke_multiblock/
 runs/scan-*/
 cookies.json
 cookies.txt
+runs/
+samples/
+download.log
