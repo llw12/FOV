@@ -48,7 +48,8 @@ class TemporalConfig:
         if not isinstance(schedule, list) or len(schedule) != config.warmup_blocks + config.repeats * len(config.ratios):
             raise ValueError("manifest schedule has invalid length")
         for index, item in enumerate(schedule):
-            if item.get("block_index") != index or item.get("ratio") not in config.ratios or item.get("flip_count") != flip_count(config.cells_per_frame, item["ratio"]):
+            allowed_ratio = item.get("ratio") == .5 if index < config.warmup_blocks else item.get("ratio") in config.ratios
+            if item.get("block_index") != index or not allowed_ratio or item.get("flip_count") != flip_count(config.cells_per_frame, item["ratio"]):
                 raise ValueError("manifest schedule entry is invalid")
             if index < config.warmup_blocks and (not item.get("warmup") or item["ratio"] != .5): raise ValueError("invalid warmup schedule")
         for repeat in range(config.repeats):
