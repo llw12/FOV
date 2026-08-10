@@ -32,4 +32,6 @@ Encoder options are `--symbol-size 6400 --repair 0.10 --crf 15 --preset medium` 
 
 Production diagnostics record RS failure positions in observed-video-frame coordinates, failed codeword counts and indices, neighboring successful transport indices and packet descriptors, and consecutive failure bursts. A transport index is inferred only when bracketing successful indices make the mapping unambiguous. This inference is diagnostic only and is never used for file recovery.
 
+For source/platform comparisons, see [FVM offline boundary diagnostics](fvm_boundary_diagnostics.md).
+
 `FVM0_RS_PROBE` remains a separate channel experiment with expected truth and raw BER measurements. FVM FILE MODE is the real file transport and never uses probe truth.
