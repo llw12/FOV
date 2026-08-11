@@ -12,4 +12,6 @@ For a block with `K` source symbols, `boundary_offset = symbol_id - (K - 1)`. Of
 
 Outputs are `boundary_summary.json`, `boundary_offsets.csv`, `boundary_frames.csv`, `rs_failure_attribution.csv`, `codeword_boundary_summary.csv`, and `failure_observed_windows.csv`. Codec metadata comes from optional `ffprobe -show_frames`; core RS and boundary analysis remains available if ffprobe fails. A full paired-frame CSV is emitted only with `--full-frame-csv`.
 
+For offline payload, RS-lane, physical-matrix, and raw-BER localization, see [FVM payload and physical-structure diagnostics](fvm_payload_structure_diagnostics.md).
+
 This is an offline paired analyzer, not the production decoder. `fvm_video2file.py` continues to recover files without source video or expected packets. Associations from one platform rendition are diagnostic evidence, not universal codec or channel guarantees.
