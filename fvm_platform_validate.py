@@ -244,12 +244,17 @@ def preflight(source: Path, original: Path, case_result: Path, run_dir: Path) ->
         raise ValueError("original input size mismatch")
     if case.get("input_sha256") != expected_sha:
         raise ValueError("case input SHA mismatch")
-    expected = {"low_level": 80, "high_level": 176, "crf": 30, "preset": "slow", "repair_ratio": EXPECTED_REPAIR,
-                "symbol_size": EXPECTED_SYMBOL_SIZE, "cell_size": 6}
-    if any(config.get(key) != value for key, value in expected.items()):
-        raise ValueError("case configuration is not the fixed 80/176 CRF30 candidate")
-    if case.get("source", {}).get("sha_exact") is not True or case.get("proxy", {}).get("sha_exact") is not True:
-        raise ValueError("sweep source/proxy baseline is not exact")
+    fixed = {"preset": "slow", "repair_ratio": EXPECTED_REPAIR, "symbol_size": EXPECTED_SYMBOL_SIZE,
+             "block_size": EXPECTED_BLOCK_SIZE, "cell_size": 6, "width": EXPECTED_WIDTH,
+             "height": EXPECTED_HEIGHT, "fps": EXPECTED_FPS}
+    if any(config.get(key) != value for key, value in fixed.items()):
+        raise ValueError("case does not match the fixed FVM platform-validation profile")
+    low, high, crf = config.get("low_level"), config.get("high_level"), config.get("crf")
+    if (not all(isinstance(value, int) and not isinstance(value, bool) for value in (low, high, crf))
+            or not 0 <= low < 128 < high <= 255 or not 0 <= crf <= 51):
+        raise ValueError("case levels/CRF are invalid")
+    if case.get("source", {}).get("sha_exact") is not True:
+        raise ValueError("sweep source baseline is not exact")
     source_probe = probe_video(source); validate_1080p_probe(source_probe, "source")
     local = production_decode_summary(source, run_dir / "local-recovered")
     if not recovery_pass(local, expected_sha):
@@ -258,7 +263,7 @@ def preflight(source: Path, original: Path, case_result: Path, run_dir: Path) ->
     return {"original": {"path": str(original), "size_bytes": original.stat().st_size, "sha256": expected_sha},
             "source": source_probe, "case_config": config, "local_decode": local,
             "expected_source_symbols": sum(block.source_symbols for block in layout),
-            "local_proxy": case["proxy"]}
+            "case_id": case.get("case_id"), "local_proxy": case.get("proxy") or {}}
 
 
 def write_report(result: dict[str, Any], path: Path) -> None:
@@ -266,7 +271,7 @@ def write_report(result: dict[str, Any], path: Path) -> None:
     decode = result.get("decode", {}); raw = result.get("raw_channel", {}); proxy = result.get("preflight", {}).get("local_proxy", {})
     comparison = result.get("proxy_comparison", {})
     lines = ["# FVM Real Platform Validation", "", "## Source case", "",
-             "- Candidate: 80/176, CRF30, x264 slow, 6 px binary, RS(255,239), RaptorQ 3%.",
+             f"- Candidate: {result.get('preflight', {}).get('case_id')}, x264 slow, 6 px binary, RS(255,239), RaptorQ 3%.",
              f"- Source: {source.get('size_bytes')} bytes, {source.get('frame_count')} frames.", "", "## Upload", "",
              f"- Attempts: {result.get('upload_attempt_count', 0)}", f"- BVID: {result.get('bvid')}", "", "## Platform rendition", "",
              f"- Format: {platform.get('format_id')} / {platform.get('codec')}",
@@ -293,9 +298,9 @@ def write_report(result: dict[str, Any], path: Path) -> None:
              f"- BER ratio (platform/proxy): {comparison.get('platform_to_proxy_ber_ratio')}",
              f"- Calibration: PROXY: {comparison.get('verdict')} ({comparison.get('classification')})", "", "## Verdict", ""]
     if result.get("state") == "PASS":
-        lines += ["80/176 CRF30 REAL PLATFORM SAMPLE: PASS", "", "One authorized 1080p platform rendition. Not a universal reliability guarantee."]
+        lines += [f"{result.get('preflight', {}).get('case_id')} REAL PLATFORM SAMPLE: PASS", "", "One authorized 1080p platform rendition. Not a universal reliability guarantee."]
     elif result.get("state") == "FAIL":
-        lines.append("80/176 CRF30 REAL PLATFORM SAMPLE: FAIL")
+        lines.append(f"{result.get('preflight', {}).get('case_id')} REAL PLATFORM SAMPLE: FAIL")
         lines += ["", "### Failed blocks", "", "| Block | Required K | Received unique | Symbol deficit |",
                   "|---:|---:|---:|---:|"]
         for block in decode.get("failed_blocks", []):
@@ -327,6 +332,7 @@ def _temporary_cookie(biliup_cookies: Path) -> tuple[Path, int]:
 def run_validation(source: Path, original: Path, case_result: Path, *, allow_upload: bool,
                    biliup: str | None, biliup_cookies: Path | None, tid: int | None,
                    output_root: Path, resume_run: Path | None = None, title: str | None = None,
+                   run_dir_override: Path | None = None,
                    tag: str = "FVM,视频信道,测试", desc: str = "FVM 6px binary codec robustness validation",
                    poll_interval: float = 60, approval_timeout: float = 10800,
                    rendition_timeout: float = 7200, status_max_pages: int = 3) -> dict[str, Any]:
@@ -334,7 +340,9 @@ def run_validation(source: Path, original: Path, case_result: Path, *, allow_upl
         raise ValueError("poll interval must be at least 60 seconds")
     source, original, case_result = source.resolve(), original.resolve(), case_result.resolve()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = resume_run.resolve() if resume_run else output_root.resolve() / f"fvm-platform-validation-{timestamp}"
+    if resume_run and run_dir_override:
+        raise ValueError("resume_run and run_dir_override are mutually exclusive")
+    run_dir = (resume_run or run_dir_override).resolve() if (resume_run or run_dir_override) else output_root.resolve() / f"fvm-platform-validation-{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=bool(resume_run))
     result_file = run_dir / "validation_result.json"
     if resume_run:

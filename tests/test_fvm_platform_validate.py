@@ -103,3 +103,36 @@ def test_positional_oracle_requires_trustworthy_alignment() -> None:
     assert not alignment_allows_positional(source, platform, {**diagnostics, "duplicate_embedded_indices": 1})
     assert not alignment_allows_positional(source, platform, {**diagnostics, "out_of_order_count": 1})
     assert not alignment_allows_positional(source, platform, {**diagnostics, "embedded_frame_gaps": 1})
+
+
+@pytest.mark.parametrize("low,high,crf", [(64, 192, 30), (72, 184, 30)])
+def test_generic_preflight_case_profile_is_accepted(monkeypatch, tmp_path: Path, low: int, high: int, crf: int) -> None:
+    from fvm_platform_validate import preflight
+    original = tmp_path / "input.bin"; original.write_bytes(b"x" * (32 * 1024 * 1024))
+    source = tmp_path / "source.mp4"; source.write_bytes(b"video")
+    digest = "a" * 64
+    case = {"case_id": f"level-{low:03d}-{high:03d}_crf{crf}", "input_sha256": digest,
+            "config": {"low_level": low, "high_level": high, "crf": crf, "preset": "slow",
+                       "repair_ratio": .03, "symbol_size": 6400, "block_size": 8 * 1024 * 1024,
+                       "cell_size": 6, "width": 1920, "height": 1080, "fps": 30},
+            "source": {"sha_exact": True}, "proxy": {}}
+    case_file = tmp_path / "case.json"; case_file.write_text(json.dumps(case))
+    monkeypatch.setattr("fvm_platform_validate.sha256_file", lambda _: digest)
+    monkeypatch.setattr("fvm_platform_validate.probe_video", lambda _: {"stream": {"width": 1920, "height": 1080}, "fps": 30, "frame_count": 1})
+    monkeypatch.setattr("fvm_platform_validate.production_decode_summary", lambda *_: {"sha_exact": True, "recovered_sha256": digest, "blocks_total": 4, "blocks_decoded": 4})
+    result = preflight(source, original, case_file, tmp_path)
+    assert result["case_config"]["low_level"] == low and result["local_proxy"] == {}
+
+
+@pytest.mark.parametrize("field,value", [("repair_ratio", .04), ("cell_size", 8), ("symbol_size", 6000)])
+def test_generic_preflight_rejects_profile_changes(monkeypatch, tmp_path: Path, field: str, value: object) -> None:
+    from fvm_platform_validate import preflight
+    original = tmp_path / "input.bin"; original.write_bytes(b"x" * (32 * 1024 * 1024))
+    source = tmp_path / "source.mp4"; source.write_bytes(b"video")
+    digest = "a" * 64
+    config = {"low_level": 64, "high_level": 192, "crf": 30, "preset": "slow", "repair_ratio": .03,
+              "symbol_size": 6400, "block_size": 8 * 1024 * 1024, "cell_size": 6,
+              "width": 1920, "height": 1080, "fps": 30}; config[field] = value
+    case_file = tmp_path / "case.json"; case_file.write_text(json.dumps({"input_sha256": digest, "config": config, "source": {"sha_exact": True}}))
+    monkeypatch.setattr("fvm_platform_validate.sha256_file", lambda _: digest)
+    with pytest.raises(ValueError, match="fixed FVM"): preflight(source, original, case_file, tmp_path)
